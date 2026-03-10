@@ -1,0 +1,25 @@
+name: decentra_call_client
+description: Маяк — мобильный мессенджер с фокусом на видеозвонки.
+publish_to: "none"
+
+version: 0.3.0+3
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_webrtc: ^1.3.0
+  web_socket_channel: ^3.0.1
+  shared_preferences: ^2.5.3
+  permission_handler: ^11.3.1
+  http: ^1.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
