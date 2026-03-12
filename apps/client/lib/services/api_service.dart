@@ -76,6 +76,109 @@ class ApiService {
     await _request('GET', _uri('/health'));
   }
 
+  UserProfile _profileFromAuthResponse(
+    Map<String, dynamic> decoded, {
+    required String serverUrl,
+  }) {
+    final userMap = decoded['user'];
+    final deviceMap = decoded['device'];
+
+    if (userMap is! Map || deviceMap is! Map) {
+      throw Exception('Сервер вернул неполный профиль');
+    }
+
+    final user = userMap.map((key, value) => MapEntry(key.toString(), value));
+    final device = deviceMap.map((key, value) => MapEntry(key.toString(), value));
+
+    return UserProfile(
+      publicId: user['publicId']?.toString() ?? '',
+      deviceId: device['deviceId']?.toString() ?? '',
+      firstName: user['firstName']?.toString() ?? '',
+      lastName: user['lastName']?.toString() ?? '',
+      phone: user['phone']?.toString() ?? '',
+      about: user['about']?.toString() ?? '',
+      serverUrl: serverUrl,
+      createdAt: DateTime.now(),
+      registered: true,
+    );
+  }
+
+  Future<AuthRegisterResult> registerWithPhone({
+    required String deviceId,
+    required String firstName,
+    required String lastName,
+    required String phone,
+    required String password,
+    required String about,
+  }) async {
+    final decoded = await _request(
+      'POST',
+      _uri('/api/auth/register'),
+      body: {
+        'deviceId': deviceId,
+        'firstName': firstName.trim(),
+        'lastName': lastName.trim(),
+        'phone': phone.trim(),
+        'password': password,
+        'about': about.trim(),
+        'platform': 'android',
+      },
+    );
+
+    final profile = _profileFromAuthResponse(decoded, serverUrl: serverUrl);
+    final rawCodes = decoded['recoveryCodes'];
+    final recoveryCodes = rawCodes is List
+        ? rawCodes
+            .whereType<Map>()
+            .map(
+              (item) => RecoveryCodeView.fromJson(
+                item.map((key, value) => MapEntry(key.toString(), value)),
+              ),
+            )
+            .toList()
+        : <RecoveryCodeView>[];
+
+    return AuthRegisterResult(
+      profile: profile,
+      recoveryCodes: recoveryCodes,
+    );
+  }
+
+  Future<UserProfile> loginWithPhone({
+    required String deviceId,
+    required String phone,
+    required String password,
+  }) async {
+    final decoded = await _request(
+      'POST',
+      _uri('/api/auth/login'),
+      body: {
+        'deviceId': deviceId,
+        'phone': phone.trim(),
+        'password': password,
+        'platform': 'android',
+      },
+    );
+
+    return _profileFromAuthResponse(decoded, serverUrl: serverUrl);
+  }
+
+  Future<void> resetPasswordWithCode({
+    required String phone,
+    required String recoveryCode,
+    required String newPassword,
+  }) async {
+    await _request(
+      'POST',
+      _uri('/api/auth/reset-password'),
+      body: {
+        'phone': phone.trim(),
+        'recoveryCode': recoveryCode.trim(),
+        'newPassword': newPassword,
+      },
+    );
+  }
+
   Future<UserProfile> registerUser(UserProfile profile) async {
     final decoded = await _request(
       'POST',

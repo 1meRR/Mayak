@@ -1,129 +1,49 @@
+mod domain;
+mod repository;
+mod storage;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use domain::models::{
+    CallInviteView, DeviceResponse, DirectMessageRecord, FriendRequestView, FriendUserView,
+    MediaObjectView, PublicUserResponse, RecoveryCodeView,
+};
 use futures::{sink::SinkExt, stream::StreamExt};
-use rand::Rng;
+use repository::{
+    build_chat_messages, build_friends_response, build_mailbox_response,
+    build_repository_recent_events, build_repository_recent_users, build_repository_status,
+    build_sync_cursors_response, build_user_lookup, ChatMessagesResponse, FriendsResponse,
+    MailboxAckResponse, MailboxResponse, RepositoryRecentEventsResponse,
+    RepositoryRecentUsersResponse, RepositoryStatusResponse, SyncCursorUpsertResponse,
+    SyncCursorsResponse, UserLookupResponse,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use storage::postgres_store::{LoginResult, PostgresStore, RegisterResult};
 use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::CorsLayer;
 
 type Tx = mpsc::UnboundedSender<Message>;
 
-const PRESENCE_ONLINE_WINDOW_MS: i64 = 20_000;
-const CALL_INVITE_TTL_MS: i64 = 45_000;
-
 #[derive(Clone)]
 struct AppState {
     rooms: Arc<RwLock<HashMap<String, HashMap<String, PeerHandle>>>>,
-    db: Arc<RwLock<AppDb>>,
-    data_file: Arc<PathBuf>,
+    admin_token: Arc<Option<String>>,
+    store: Arc<PostgresStore>,
 }
 
 #[derive(Clone)]
 struct PeerHandle {
-    display_name: String,
     tx: Tx,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
-struct AppDb {
-    users: HashMap<String, UserRecord>,
-    devices: HashMap<String, DeviceRecord>,
-    presences: HashMap<String, PresenceRecord>,
-    friend_requests: HashMap<String, FriendRequestRecord>,
-    friendships: Vec<FriendshipRecord>,
-    messages: HashMap<String, Vec<DirectMessageRecord>>,
-    call_invites: HashMap<String, CallInviteRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UserRecord {
-    public_id: String,
-    first_name: String,
-    last_name: String,
-    phone: String,
-    about: String,
-    created_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeviceRecord {
-    device_id: String,
-    owner_public_id: String,
-    platform: String,
-    created_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PresenceRecord {
-    device_id: String,
-    owner_public_id: String,
-    last_seen_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FriendRequestRecord {
-    id: String,
-    from_public_id: String,
-    to_public_id: String,
-    status: String,
-    created_at: i64,
-    responded_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FriendshipRecord {
-    user_a_public_id: String,
-    user_b_public_id: String,
-    created_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DirectMessageRecord {
-    id: String,
-    chat_id: String,
-    from_public_id: String,
-    to_public_id: String,
-    text: String,
-    created_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CallInviteRecord {
-    id: String,
-    caller_public_id: String,
-    caller_display_name: String,
-    callee_public_id: String,
-    callee_display_name: String,
-    room_id: String,
-    status: String,
-    created_at: i64,
-    responded_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,41 +88,6 @@ struct HealthResponse {
     call_invites_count: usize,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RegisterRequest {
-    public_id: String,
-    device_id: String,
-    first_name: String,
-    last_name: Option<String>,
-    phone: Option<String>,
-    about: Option<String>,
-    platform: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PublicUserResponse {
-    public_id: String,
-    display_name: String,
-    first_name: String,
-    last_name: String,
-    phone: String,
-    about: String,
-    created_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DeviceResponse {
-    device_id: String,
-    owner_public_id: String,
-    platform: String,
-    created_at: i64,
-    updated_at: i64,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RegisterResponse {
@@ -210,10 +95,72 @@ struct RegisterResponse {
     device: DeviceResponse,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthRegisterRequest {
+    device_id: String,
+    first_name: String,
+    last_name: Option<String>,
+    phone: String,
+    password: String,
+    about: Option<String>,
+    platform: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthLoginRequest {
+    device_id: String,
+    phone: String,
+    password: String,
+    platform: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetPasswordRequest {
+    phone: String,
+    recovery_code: String,
+    new_password: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UserLookupResponse {
+struct AuthRegisterResponse {
     user: PublicUserResponse,
+    device: DeviceResponse,
+    recovery_codes: Vec<RecoveryCodeView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthLoginResponse {
+    user: PublicUserResponse,
+    device: DeviceResponse,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BasicSuccessResponse {
+    ok: bool,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminUserView {
+    public_id: String,
+    display_name: String,
+    phone: String,
+    created_at: i64,
+    updated_at: i64,
+    recovery_codes: Vec<RecoveryCodeView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminUsersResponse {
+    users: Vec<AdminUserView>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,38 +194,6 @@ struct FriendRespondRequest {
     action: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FriendRequestView {
-    id: String,
-    from_public_id: String,
-    from_display_name: String,
-    to_public_id: String,
-    to_display_name: String,
-    status: String,
-    created_at: i64,
-    responded_at: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FriendUserView {
-    public_id: String,
-    display_name: String,
-    about: String,
-    is_online: bool,
-    last_seen_at: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FriendsResponse {
-    public_id: String,
-    friends: Vec<FriendUserView>,
-    incoming_requests: Vec<FriendRequestView>,
-    outgoing_requests: Vec<FriendRequestView>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendMessageRequest {
@@ -294,11 +209,52 @@ struct SendMessageResponse {
     message: DirectMessageRecord,
 }
 
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaUploadRequest {
+    owner_public_id: String,
+    owner_device_id: String,
+    media_kind: String,
+    content_type: String,
+    file_name: String,
+    base64_data: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ChatMessagesResponse {
+struct MediaUploadResponse {
+    media: MediaObjectView,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendMediaMessageRequest {
+    from_public_id: String,
+    to_public_id: String,
+    media_id: String,
+    text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendMediaMessageResponse {
     chat_id: String,
-    items: Vec<DirectMessageRecord>,
+    event_id: String,
+    media_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MailboxAckRequest {
+    mailbox_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncCursorUpsertRequest {
+    stream_key: String,
+    cursor_value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,20 +270,6 @@ struct RespondCallInviteRequest {
     invite_id: String,
     actor_public_id: String,
     action: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CallInviteView {
-    id: String,
-    caller_public_id: String,
-    caller_display_name: String,
-    callee_public_id: String,
-    callee_display_name: String,
-    room_id: String,
-    status: String,
-    created_at: i64,
-    responded_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -353,11 +295,7 @@ impl IntoResponse for ApiError {
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
-
-        let body = Json(json!({
-            "error": message,
-        }));
-
+        let body = Json(json!({ "error": message }));
         (status, body).into_response()
     }
 }
@@ -369,32 +307,46 @@ async fn main() {
         .parse()
         .expect("BIND_ADDR must be in host:port format");
 
-    let data_file = std::env::var("DATA_FILE").unwrap_or_else(|_| "./data/state.json".to_string());
-    let data_file = PathBuf::from(data_file);
+    let admin_token = std::env::var("ADMIN_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
 
-    let db = load_db(&data_file).await;
+    let store = PostgresStore::from_env().await.expect("postgres store init failed");
 
     let state = AppState {
         rooms: Arc::new(RwLock::new(HashMap::new())),
-        db: Arc::new(RwLock::new(db)),
-        data_file: Arc::new(data_file),
+        admin_token: Arc::new(admin_token),
+        store: Arc::new(store),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/ws", get(ws_handler))
-        .route("/api/register", post(register_user))
+        .route("/api/auth/register", post(auth_register))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/reset-password", post(reset_password_with_code))
+        .route("/api/admin/users", get(admin_list_users))
         .route("/api/presence/heartbeat", post(presence_heartbeat))
         .route("/api/users/by-public-id/{public_id}", get(get_user_by_public_id))
         .route("/api/friends/request", post(create_friend_request))
         .route("/api/friends/respond", post(respond_friend_request))
         .route("/api/friends/{public_id}", get(get_friends))
         .route("/api/messages/send", post(send_message))
+        .route("/api/messages/send-media", post(send_media_message))
+        .route("/api/media/upload", post(upload_media))
+        .route("/api/media/file/{media_id}", get(get_media_file))
+        .route("/api/mailbox/{device_id}", get(get_mailbox))
+        .route("/api/mailbox/{device_id}/ack", post(ack_mailbox))
+        .route("/api/sync/{device_id}", get(get_sync_cursors).post(upsert_sync_cursor))
         .route("/api/chats/{chat_id}/messages", get(get_chat_messages))
         .route("/api/calls/invite", post(create_call_invite))
         .route("/api/calls/respond", post(respond_call_invite))
         .route("/api/calls/incoming/{public_id}", get(get_incoming_calls))
         .route("/api/calls/{invite_id}", get(get_call_invite))
+        .route("/api/repository/status", get(repository_status))
+        .route("/api/repository/recent-events", get(repository_recent_events))
+        .route("/api/repository/recent-users", get(repository_recent_users))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
@@ -411,180 +363,112 @@ async fn main() {
         .expect("axum server failed");
 }
 
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    let users_count = state.db.read().await.users.len();
-    let call_invites_count = state.db.read().await.call_invites.len();
+async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
+    let counts = state.store.fetch_health_counts().await.map_err(ApiError::Internal)?;
     let rooms_count = state.rooms.read().await.len();
-
-    Json(HealthResponse {
+    Ok(Json(HealthResponse {
         status: "ok".to_string(),
         service: "mayak-server".to_string(),
-        users_count,
+        users_count: counts.users_count as usize,
         rooms_count,
-        call_invites_count,
-    })
+        call_invites_count: counts.call_invites_count as usize,
+    }))
 }
 
-async fn register_user(
+async fn auth_register(
     State(state): State<AppState>,
-    Json(payload): Json<RegisterRequest>,
-) -> Result<Json<RegisterResponse>, ApiError> {
-    let public_id = normalize_id(&payload.public_id);
-    let device_id = normalize_id(&payload.device_id);
-    let first_name = payload.first_name.trim().to_string();
-    let last_name = payload.last_name.unwrap_or_default().trim().to_string();
-    let phone = payload.phone.unwrap_or_default().trim().to_string();
-    let about = payload.about.unwrap_or_default().trim().to_string();
-    let platform = payload.platform.unwrap_or_else(|| "unknown".to_string());
-    let now = now_ts();
+    Json(payload): Json<AuthRegisterRequest>,
+) -> Result<Json<AuthRegisterResponse>, ApiError> {
+    let RegisterResult { user, device, recovery_codes } = state
+        .store
+        .register_user(
+            &payload.device_id,
+            &payload.first_name,
+            payload.last_name.as_deref().unwrap_or_default(),
+            &payload.phone,
+            &payload.password,
+            payload.about.as_deref().unwrap_or_default(),
+            payload.platform.as_deref().unwrap_or("unknown"),
+        )
+        .await
+        .map_err(ApiError::Conflict)?;
 
-    if public_id.is_empty() {
-        return Err(ApiError::BadRequest("publicId обязателен".to_string()));
-    }
-    if device_id.is_empty() {
-        return Err(ApiError::BadRequest("deviceId обязателен".to_string()));
-    }
-    if first_name.is_empty() {
-        return Err(ApiError::BadRequest("firstName обязателен".to_string()));
-    }
+    Ok(Json(AuthRegisterResponse { user, device, recovery_codes }))
+}
 
-    let response = {
-        let mut db = state.db.write().await;
+async fn auth_login(
+    State(state): State<AppState>,
+    Json(payload): Json<AuthLoginRequest>,
+) -> Result<Json<AuthLoginResponse>, ApiError> {
+    let LoginResult { user, device } = state
+        .store
+        .login_user(
+            &payload.device_id,
+            &payload.phone,
+            &payload.password,
+            payload.platform.as_deref().unwrap_or("unknown"),
+        )
+        .await
+        .map_err(ApiError::Conflict)?;
 
-        if let Some(existing_device) = db.devices.get(&device_id) {
-            if existing_device.owner_public_id != public_id {
-                return Err(ApiError::Conflict(
-                    "Этот deviceId уже привязан к другому пользователю".to_string(),
-                ));
-            }
-        }
+    Ok(Json(AuthLoginResponse { user, device }))
+}
 
-        let user_snapshot = {
-            let user_entry = db.users.entry(public_id.clone()).or_insert(UserRecord {
-                public_id: public_id.clone(),
-                first_name: first_name.clone(),
-                last_name: last_name.clone(),
-                phone: phone.clone(),
-                about: about.clone(),
-                created_at: now,
-                updated_at: now,
-            });
+async fn reset_password_with_code(
+    State(state): State<AppState>,
+    Json(payload): Json<ResetPasswordRequest>,
+) -> Result<Json<BasicSuccessResponse>, ApiError> {
+    state
+        .store
+        .reset_password(&payload.phone, &payload.recovery_code, &payload.new_password)
+        .await
+        .map_err(ApiError::Conflict)?;
 
-            user_entry.first_name = first_name.clone();
-            user_entry.last_name = last_name.clone();
-            user_entry.phone = phone.clone();
-            user_entry.about = about.clone();
-            user_entry.updated_at = now;
+    Ok(Json(BasicSuccessResponse {
+        ok: true,
+        message: "Пароль обновлён".to_string(),
+    }))
+}
 
-            user_entry.clone()
-        };
-
-        let device_snapshot = {
-            let device_entry = db.devices.entry(device_id.clone()).or_insert(DeviceRecord {
-                device_id: device_id.clone(),
-                owner_public_id: public_id.clone(),
-                platform: platform.clone(),
-                created_at: now,
-                updated_at: now,
-            });
-
-            device_entry.owner_public_id = public_id.clone();
-            device_entry.platform = platform.clone();
-            device_entry.updated_at = now;
-
-            device_entry.clone()
-        };
-
-        db.presences.insert(
-            device_id.clone(),
-            PresenceRecord {
-                device_id: device_id.clone(),
-                owner_public_id: public_id.clone(),
-                last_seen_at: now,
-                updated_at: now,
-            },
-        );
-
-        RegisterResponse {
-            user: to_public_user(&user_snapshot),
-            device: to_device_response(&device_snapshot),
-        }
-    };
-
-    persist_db(&state).await?;
-    Ok(Json(response))
+async fn admin_list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminUsersResponse>, ApiError> {
+    require_admin(&state, &headers)?;
+    let rows = state.store.list_admin_users().await.map_err(ApiError::Internal)?;
+    let users = rows
+        .into_iter()
+        .map(|(user, recovery_codes)| AdminUserView {
+            public_id: user.public_id,
+            display_name: user.display_name,
+            phone: user.phone,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+            recovery_codes,
+        })
+        .collect();
+    Ok(Json(AdminUsersResponse { users }))
 }
 
 async fn presence_heartbeat(
     State(state): State<AppState>,
     Json(payload): Json<PresenceHeartbeatRequest>,
 ) -> Result<Json<PresenceHeartbeatResponse>, ApiError> {
-    let public_id = normalize_id(&payload.public_id);
-    let device_id = normalize_id(&payload.device_id);
-    let now = now_ts();
-
-    if public_id.is_empty() || device_id.is_empty() {
-        return Err(ApiError::BadRequest("publicId и deviceId обязательны".to_string()));
-    }
-
-    let response = {
-        let mut db = state.db.write().await;
-
-        if !db.users.contains_key(&public_id) {
-            return Err(ApiError::NotFound("Пользователь не найден".to_string()));
-        }
-
-        let device_entry = db.devices.entry(device_id.clone()).or_insert(DeviceRecord {
-            device_id: device_id.clone(),
-            owner_public_id: public_id.clone(),
-            platform: "unknown".to_string(),
-            created_at: now,
-            updated_at: now,
-        });
-
-        device_entry.owner_public_id = public_id.clone();
-        device_entry.updated_at = now;
-
-        db.presences.insert(
-            device_id.clone(),
-            PresenceRecord {
-                device_id: device_id.clone(),
-                owner_public_id: public_id.clone(),
-                last_seen_at: now,
-                updated_at: now,
-            },
-        );
-
-        PresenceHeartbeatResponse {
-            public_id,
-            device_id,
-            last_seen_at: now,
-            is_online: true,
-        }
-    };
-
-    persist_db(&state).await?;
-    Ok(Json(response))
+    let (public_id, device_id, last_seen_at, is_online) = state
+        .store
+        .heartbeat(&payload.public_id, &payload.device_id)
+        .await
+        .map_err(ApiError::Conflict)?;
+    Ok(Json(PresenceHeartbeatResponse { public_id, device_id, last_seen_at, is_online }))
 }
 
 async fn get_user_by_public_id(
     Path(public_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<UserLookupResponse>, ApiError> {
-    let public_id = normalize_id(&public_id);
-
-    let response = {
-        let db = state.db.read().await;
-        let user = db
-            .users
-            .get(&public_id)
-            .ok_or_else(|| ApiError::NotFound("Пользователь не найден".to_string()))?;
-
-        UserLookupResponse {
-            user: to_public_user(user),
-        }
-    };
-
+    let response = build_user_lookup(&state.store, &public_id)
+        .await
+        .map_err(ApiError::NotFound)?;
     Ok(Json(response))
 }
 
@@ -592,176 +476,33 @@ async fn create_friend_request(
     State(state): State<AppState>,
     Json(payload): Json<FriendRequestCreateRequest>,
 ) -> Result<Json<FriendRequestView>, ApiError> {
-    let from_public_id = normalize_id(&payload.from_public_id);
-    let to_public_id = normalize_id(&payload.to_public_id);
-
-    if from_public_id.is_empty() || to_public_id.is_empty() {
-        return Err(ApiError::BadRequest("fromPublicId и toPublicId обязательны".to_string()));
-    }
-    if from_public_id == to_public_id {
-        return Err(ApiError::BadRequest("Нельзя добавить самого себя".to_string()));
-    }
-
-    let response = {
-        let mut db = state.db.write().await;
-
-        if !db.users.contains_key(&from_public_id) {
-            return Err(ApiError::NotFound("Отправитель не найден".to_string()));
-        }
-        if !db.users.contains_key(&to_public_id) {
-            return Err(ApiError::NotFound("Получатель не найден".to_string()));
-        }
-
-        if are_friends(&db.friendships, &from_public_id, &to_public_id) {
-            return Err(ApiError::Conflict("Пользователи уже в друзьях".to_string()));
-        }
-
-        let already_pending = db.friend_requests.values().any(|item| {
-            item.status == "pending"
-                && ((item.from_public_id == from_public_id && item.to_public_id == to_public_id)
-                    || (item.from_public_id == to_public_id
-                        && item.to_public_id == from_public_id))
-        });
-
-        if already_pending {
-            return Err(ApiError::Conflict("Заявка уже существует".to_string()));
-        }
-
-        let now = now_ts();
-        let request_id = generate_entity_id("FR");
-        let record = FriendRequestRecord {
-            id: request_id.clone(),
-            from_public_id: from_public_id.clone(),
-            to_public_id: to_public_id.clone(),
-            status: "pending".to_string(),
-            created_at: now,
-            responded_at: None,
-        };
-
-        db.friend_requests.insert(request_id.clone(), record.clone());
-
-        to_friend_request_view(&db, &record)
-    };
-
-    persist_db(&state).await?;
-    Ok(Json(response))
+    let view = state
+        .store
+        .create_friend_request(&payload.from_public_id, &payload.to_public_id)
+        .await
+        .map_err(ApiError::Conflict)?;
+    Ok(Json(view))
 }
 
 async fn respond_friend_request(
     State(state): State<AppState>,
     Json(payload): Json<FriendRespondRequest>,
 ) -> Result<Json<FriendRequestView>, ApiError> {
-    let request_id = payload.request_id.trim().to_string();
-    let actor_public_id = normalize_id(&payload.actor_public_id);
-    let action = payload.action.trim().to_lowercase();
-
-    if request_id.is_empty() {
-        return Err(ApiError::BadRequest("requestId обязателен".to_string()));
-    }
-    if actor_public_id.is_empty() {
-        return Err(ApiError::BadRequest("actorPublicId обязателен".to_string()));
-    }
-    if action != "accept" && action != "reject" {
-        return Err(ApiError::BadRequest("action должен быть accept или reject".to_string()));
-    }
-
-    let response = {
-        let mut db = state.db.write().await;
-
-        let snapshot = db
-            .friend_requests
-            .get(&request_id)
-            .cloned()
-            .ok_or_else(|| ApiError::NotFound("Заявка не найдена".to_string()))?;
-
-        if snapshot.status != "pending" {
-            return Err(ApiError::Conflict("Заявка уже обработана".to_string()));
-        }
-
-        if snapshot.to_public_id != actor_public_id {
-            return Err(ApiError::Conflict(
-                "Только получатель заявки может её обработать".to_string(),
-            ));
-        }
-
-        let now = now_ts();
-
-        if action == "accept"
-            && !are_friends(
-                &db.friendships,
-                &snapshot.from_public_id,
-                &snapshot.to_public_id,
-            )
-        {
-            let (user_a_public_id, user_b_public_id) =
-                sort_two_ids(&snapshot.from_public_id, &snapshot.to_public_id);
-
-            db.friendships.push(FriendshipRecord {
-                user_a_public_id,
-                user_b_public_id,
-                created_at: now,
-            });
-        }
-
-        let item_snapshot = {
-            let item = db
-                .friend_requests
-                .get_mut(&request_id)
-                .ok_or_else(|| ApiError::NotFound("Заявка не найдена".to_string()))?;
-
-            item.status = if action == "accept" {
-                "accepted".to_string()
-            } else {
-                "rejected".to_string()
-            };
-            item.responded_at = Some(now);
-
-            item.clone()
-        };
-
-        to_friend_request_view(&db, &item_snapshot)
-    };
-
-    persist_db(&state).await?;
-    Ok(Json(response))
+    let view = state
+        .store
+        .respond_friend_request(&payload.request_id, &payload.actor_public_id, &payload.action)
+        .await
+        .map_err(ApiError::Conflict)?;
+    Ok(Json(view))
 }
 
 async fn get_friends(
     Path(public_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<FriendsResponse>, ApiError> {
-    let public_id = normalize_id(&public_id);
-
-    let response = {
-        let db = state.db.read().await;
-
-        if !db.users.contains_key(&public_id) {
-            return Err(ApiError::NotFound("Пользователь не найден".to_string()));
-        }
-
-        let friends = collect_friends(&db, &public_id);
-        let incoming_requests = db
-            .friend_requests
-            .values()
-            .filter(|item| item.to_public_id == public_id && item.status == "pending")
-            .map(|item| to_friend_request_view(&db, item))
-            .collect::<Vec<_>>();
-
-        let outgoing_requests = db
-            .friend_requests
-            .values()
-            .filter(|item| item.from_public_id == public_id && item.status == "pending")
-            .map(|item| to_friend_request_view(&db, item))
-            .collect::<Vec<_>>();
-
-        FriendsResponse {
-            public_id,
-            friends,
-            incoming_requests,
-            outgoing_requests,
-        }
-    };
-
+    let response = build_friends_response(&state.store, &public_id)
+        .await
+        .map_err(ApiError::NotFound)?;
     Ok(Json(response))
 }
 
@@ -769,270 +510,217 @@ async fn send_message(
     State(state): State<AppState>,
     Json(payload): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, ApiError> {
-    let from_public_id = normalize_id(&payload.from_public_id);
-    let to_public_id = normalize_id(&payload.to_public_id);
-    let text = payload.text.trim().to_string();
-
-    if from_public_id.is_empty() || to_public_id.is_empty() {
-        return Err(ApiError::BadRequest("fromPublicId и toPublicId обязательны".to_string()));
-    }
-    if text.is_empty() {
-        return Err(ApiError::BadRequest("text обязателен".to_string()));
-    }
-
-    let response = {
-        let mut db = state.db.write().await;
-
-        if !db.users.contains_key(&from_public_id) {
-            return Err(ApiError::NotFound("Отправитель не найден".to_string()));
-        }
-        if !db.users.contains_key(&to_public_id) {
-            return Err(ApiError::NotFound("Получатель не найден".to_string()));
-        }
-
-        if from_public_id != to_public_id
-            && !are_friends(&db.friendships, &from_public_id, &to_public_id)
-        {
-            return Err(ApiError::Conflict(
-                "Сообщения доступны только друзьям".to_string(),
-            ));
-        }
-
-        let chat_id = build_direct_chat_id(&from_public_id, &to_public_id);
-        let record = DirectMessageRecord {
-            id: generate_entity_id("MSG"),
-            chat_id: chat_id.clone(),
-            from_public_id: from_public_id.clone(),
-            to_public_id: to_public_id.clone(),
-            text,
-            created_at: now_ts(),
-        };
-
-        db.messages
-            .entry(chat_id.clone())
-            .or_default()
-            .push(record.clone());
-
-        SendMessageResponse {
-            chat_id,
-            message: record,
-        }
-    };
-
-    persist_db(&state).await?;
-    Ok(Json(response))
+    let (chat_id, message) = state
+        .store
+        .send_direct_message(&payload.from_public_id, &payload.to_public_id, &payload.text)
+        .await
+        .map_err(ApiError::Conflict)?;
+    Ok(Json(SendMessageResponse { chat_id, message }))
 }
 
 async fn get_chat_messages(
     Path(chat_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ChatMessagesResponse>, ApiError> {
-    let response = {
-        let db = state.db.read().await;
-        let items = db.messages.get(&chat_id).cloned().unwrap_or_default();
-
-        ChatMessagesResponse { chat_id, items }
-    };
-
+    let response = build_chat_messages(&state.store, &chat_id)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(response))
+}
+
+
+async fn upload_media(
+    State(state): State<AppState>,
+    Json(payload): Json<MediaUploadRequest>,
+) -> Result<Json<MediaUploadResponse>, ApiError> {
+    let media = state
+        .store
+        .upload_media(
+            &payload.owner_public_id,
+            &payload.owner_device_id,
+            &payload.media_kind,
+            &payload.content_type,
+            &payload.file_name,
+            &payload.base64_data,
+        )
+        .await
+        .map_err(ApiError::Conflict)?;
+    Ok(Json(MediaUploadResponse { media }))
+}
+
+async fn get_media_file(
+    Path(media_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let file = state
+        .store
+        .read_media_file(&media_id)
+        .await
+        .map_err(ApiError::NotFound)?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&file.content_type)
+            .map_err(|e| ApiError::Internal(format!("Некорректный content-type: {e}")))?,
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("inline; filename=\"{}\"", sanitize_header_value(&file.file_name)))
+            .map_err(|e| ApiError::Internal(format!("Некорректный fileName: {e}")))?,
+    );
+
+    Ok((headers, file.bytes).into_response())
+}
+
+async fn send_media_message(
+    State(state): State<AppState>,
+    Json(payload): Json<SendMediaMessageRequest>,
+) -> Result<Json<SendMediaMessageResponse>, ApiError> {
+    let text = payload.text.as_deref().unwrap_or_default();
+    let (chat_id, event_id) = state
+        .store
+        .send_media_message(&payload.from_public_id, &payload.to_public_id, &payload.media_id, text)
+        .await
+        .map_err(ApiError::Conflict)?;
+    Ok(Json(SendMediaMessageResponse {
+        chat_id,
+        event_id,
+        media_id: payload.media_id,
+    }))
+}
+
+async fn get_mailbox(
+    Path(device_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<MailboxResponse>, ApiError> {
+    let response = build_mailbox_response(&state.store, &device_id)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(response))
+}
+
+async fn ack_mailbox(
+    Path(device_id): Path<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<MailboxAckRequest>,
+) -> Result<Json<MailboxAckResponse>, ApiError> {
+    let result = state
+        .store
+        .ack_mailbox(&device_id, &payload.mailbox_ids)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(MailboxAckResponse { ok: true, result }))
+}
+
+async fn get_sync_cursors(
+    Path(device_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<SyncCursorsResponse>, ApiError> {
+    let response = build_sync_cursors_response(&state.store, &device_id)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(response))
+}
+
+async fn upsert_sync_cursor(
+    Path(device_id): Path<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<SyncCursorUpsertRequest>,
+) -> Result<Json<SyncCursorUpsertResponse>, ApiError> {
+    let item = state
+        .store
+        .upsert_sync_cursor(&device_id, &payload.stream_key, &payload.cursor_value)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(SyncCursorUpsertResponse { ok: true, item }))
 }
 
 async fn create_call_invite(
     State(state): State<AppState>,
     Json(payload): Json<CreateCallInviteRequest>,
 ) -> Result<Json<CallInviteView>, ApiError> {
-    let caller_public_id = normalize_id(&payload.caller_public_id);
-    let callee_public_id = normalize_id(&payload.callee_public_id);
-
-    if caller_public_id.is_empty() || callee_public_id.is_empty() {
-        return Err(ApiError::BadRequest(
-            "callerPublicId и calleePublicId обязательны".to_string(),
-        ));
-    }
-    if caller_public_id == callee_public_id {
-        return Err(ApiError::BadRequest("Нельзя звонить самому себе".to_string()));
-    }
-
-    let response = {
-        let mut db = state.db.write().await;
-        expire_stale_call_invites(&mut db);
-
-        let caller = db
-            .users
-            .get(&caller_public_id)
-            .cloned()
-            .ok_or_else(|| ApiError::NotFound("Звонящий не найден".to_string()))?;
-        let callee = db
-            .users
-            .get(&callee_public_id)
-            .cloned()
-            .ok_or_else(|| ApiError::NotFound("Получатель звонка не найден".to_string()))?;
-
-        if !are_friends(&db.friendships, &caller_public_id, &callee_public_id) {
-            return Err(ApiError::Conflict(
-                "Звонок доступен только друзьям".to_string(),
-            ));
-        }
-
-        let has_pending = db.call_invites.values().any(|item| {
-            item.status == "pending"
-                && ((item.caller_public_id == caller_public_id
-                    && item.callee_public_id == callee_public_id)
-                    || (item.caller_public_id == callee_public_id
-                        && item.callee_public_id == caller_public_id))
-        });
-
-        if has_pending {
-            return Err(ApiError::Conflict(
-                "Уже есть активный звонок или приглашение".to_string(),
-            ));
-        }
-
-        let record = CallInviteRecord {
-            id: generate_entity_id("CALL"),
-            caller_public_id: caller_public_id.clone(),
-            caller_display_name: display_name_of(&caller),
-            callee_public_id: callee_public_id.clone(),
-            callee_display_name: display_name_of(&callee),
-            room_id: build_direct_room_id(&caller_public_id, &callee_public_id),
-            status: "pending".to_string(),
-            created_at: now_ts(),
-            responded_at: None,
-        };
-
-        let snapshot = record.clone();
-        db.call_invites.insert(record.id.clone(), record);
-
-        to_call_invite_view(&snapshot)
-    };
-
-    persist_db(&state).await?;
-    Ok(Json(response))
+    let view = state
+        .store
+        .create_call_invite(&payload.caller_public_id, &payload.callee_public_id)
+        .await
+        .map_err(ApiError::Conflict)?;
+    Ok(Json(view))
 }
 
 async fn respond_call_invite(
     State(state): State<AppState>,
     Json(payload): Json<RespondCallInviteRequest>,
 ) -> Result<Json<CallInviteView>, ApiError> {
-    let invite_id = payload.invite_id.trim().to_string();
-    let actor_public_id = normalize_id(&payload.actor_public_id);
-    let action = payload.action.trim().to_lowercase();
-
-    if invite_id.is_empty() {
-        return Err(ApiError::BadRequest("inviteId обязателен".to_string()));
-    }
-    if actor_public_id.is_empty() {
-        return Err(ApiError::BadRequest("actorPublicId обязателен".to_string()));
-    }
-    if action != "accept" && action != "reject" {
-        return Err(ApiError::BadRequest(
-            "action должен быть accept или reject".to_string(),
-        ));
-    }
-
-    let response = {
-        let mut db = state.db.write().await;
-        expire_stale_call_invites(&mut db);
-
-        let snapshot = db
-            .call_invites
-            .get(&invite_id)
-            .cloned()
-            .ok_or_else(|| ApiError::NotFound("Приглашение не найдено".to_string()))?;
-
-        if snapshot.status != "pending" {
-            return Err(ApiError::Conflict(
-                "Приглашение уже обработано".to_string(),
-            ));
-        }
-
-        if snapshot.callee_public_id != actor_public_id {
-            return Err(ApiError::Conflict(
-                "Только вызываемый пользователь может ответить".to_string(),
-            ));
-        }
-
-        let updated = {
-            let item = db
-                .call_invites
-                .get_mut(&invite_id)
-                .ok_or_else(|| ApiError::NotFound("Приглашение не найдено".to_string()))?;
-
-            item.status = if action == "accept" {
-                "accepted".to_string()
-            } else {
-                "rejected".to_string()
-            };
-            item.responded_at = Some(now_ts());
-
-            item.clone()
-        };
-
-        to_call_invite_view(&updated)
-    };
-
-    persist_db(&state).await?;
-    Ok(Json(response))
+    let view = state
+        .store
+        .respond_call_invite(&payload.invite_id, &payload.actor_public_id, &payload.action)
+        .await
+        .map_err(ApiError::Conflict)?;
+    Ok(Json(view))
 }
 
 async fn get_incoming_calls(
     Path(public_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<CallInvitesResponse>, ApiError> {
-    let public_id = normalize_id(&public_id);
-
-    let response = {
-        let mut db = state.db.write().await;
-        expire_stale_call_invites(&mut db);
-
-        let items = db
-            .call_invites
-            .values()
-            .filter(|item| item.callee_public_id == public_id && item.status == "pending")
-            .cloned()
-            .map(|item| to_call_invite_view(&item))
-            .collect::<Vec<_>>();
-
-        CallInvitesResponse { public_id, items }
-    };
-
-    persist_db(&state).await?;
-    Ok(Json(response))
+    let items = state
+        .store
+        .fetch_incoming_calls(&public_id)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(CallInvitesResponse { public_id, items }))
 }
 
 async fn get_call_invite(
     Path(invite_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<CallInviteView>, ApiError> {
-    let response = {
-        let mut db = state.db.write().await;
-        expire_stale_call_invites(&mut db);
+    let view = state
+        .store
+        .fetch_call_invite(&invite_id)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound("Приглашение не найдено".to_string()))?;
+    Ok(Json(view))
+}
 
-        let item = db
-            .call_invites
-            .get(&invite_id)
-            .cloned()
-            .ok_or_else(|| ApiError::NotFound("Приглашение не найдено".to_string()))?;
-
-        to_call_invite_view(&item)
-    };
-
-    persist_db(&state).await?;
+async fn repository_status(
+    State(state): State<AppState>,
+) -> Result<Json<RepositoryStatusResponse>, ApiError> {
+    let response = build_repository_status(&state.store)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(response))
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
+async fn repository_recent_events(
     State(state): State<AppState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+) -> Result<Json<RepositoryRecentEventsResponse>, ApiError> {
+    let response = build_repository_recent_events(&state.store)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(response))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
-    let (mut sender, mut receiver) = socket.split();
+async fn repository_recent_users(
+    State(state): State<AppState>,
+) -> Result<Json<RepositoryRecentUsersResponse>, ApiError> {
+    let response = build_repository_recent_users(&state.store)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(response))
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| websocket_session(socket, state))
+}
+
+async fn websocket_session(stream: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             if sender.send(message).await.is_err() {
                 break;
@@ -1044,160 +732,98 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let mut current_peer_id: Option<String> = None;
 
     while let Some(Ok(message)) = receiver.next().await {
-        if let Message::Text(text) = message {
-            let parsed = serde_json::from_str::<SignalMessage>(&text);
-            let Ok(signal) = parsed else {
-                continue;
-            };
+        match message {
+            Message::Text(text) => {
+                let Ok(signal) = serde_json::from_str::<SignalMessage>(&text) else {
+                    continue;
+                };
 
-            match signal.message_type.as_str() {
-                "join" => {
-                    let Some(room_id) = signal.room_id.clone() else {
-                        continue;
-                    };
-                    let Some(peer_id) = signal.peer_id.clone() else {
-                        continue;
-                    };
-                    let display_name = signal
-                        .display_name
-                        .clone()
-                        .unwrap_or_else(|| "Guest".to_string());
+                match signal.message_type.as_str() {
+                    "join" => {
+                        let Some(room_id) = signal.room_id.clone() else { continue; };
+                        let Some(peer_id) = signal.peer_id.clone() else { continue; };
 
-                    current_room_id = Some(room_id.clone());
-                    current_peer_id = Some(peer_id.clone());
+                        let peers = {
+                            let mut rooms = state.rooms.write().await;
+                            let room = rooms.entry(room_id.clone()).or_default();
+                            room.insert(peer_id.clone(), PeerHandle { tx: tx.clone() });
+                            room.keys().cloned().collect::<Vec<_>>()
+                        };
 
-                    let (existing_peers, receivers_to_notify) = {
-                        let mut rooms = state.rooms.write().await;
-                        let room = rooms.entry(room_id.clone()).or_default();
+                        current_room_id = Some(room_id.clone());
+                        current_peer_id = Some(peer_id.clone());
 
-                        let existing_peers = room
-                            .iter()
-                            .map(|(id, peer)| PeerMeta {
-                                peer_id: id.clone(),
-                                display_name: peer.display_name.clone(),
+                        let peer_list = peers
+                            .into_iter()
+                            .map(|id| PeerMeta {
+                                display_name: id.clone(),
+                                peer_id: id,
                             })
                             .collect::<Vec<_>>();
 
-                        room.insert(
-                            peer_id.clone(),
-                            PeerHandle {
-                                display_name: display_name.clone(),
-                                tx: tx.clone(),
-                            },
-                        );
+                        let joined_message = SignalMessage {
+                            message_type: "peers".to_string(),
+                            room_id: Some(room_id),
+                            peer_id: Some(peer_id),
+                            target_peer_id: None,
+                            display_name: None,
+                            sdp: None,
+                            sdp_type: None,
+                            candidate: None,
+                            text: None,
+                            timestamp: Some(now_ts()),
+                            peers: Some(peer_list),
+                        };
 
-                        let receivers = room
-                            .iter()
-                            .filter(|(id, _)| *id != &peer_id)
-                            .map(|(_, peer)| peer.tx.clone())
-                            .collect::<Vec<_>>();
-
-                        (existing_peers, receivers)
-                    };
-
-                    let existing_message = SignalMessage {
-                        message_type: "existing_peers".to_string(),
-                        room_id: Some(room_id.clone()),
-                        peer_id: Some(peer_id.clone()),
-                        target_peer_id: None,
-                        display_name: Some(display_name.clone()),
-                        sdp: None,
-                        sdp_type: None,
-                        candidate: None,
-                        text: None,
-                        timestamp: Some(now_ts()),
-                        peers: Some(existing_peers),
-                    };
-                    send_to_one(&tx, &existing_message);
-
-                    let joined_message = SignalMessage {
-                        message_type: "peer_joined".to_string(),
-                        room_id: Some(room_id),
-                        peer_id: Some(peer_id),
-                        target_peer_id: None,
-                        display_name: Some(display_name),
-                        sdp: None,
-                        sdp_type: None,
-                        candidate: None,
-                        text: None,
-                        timestamp: Some(now_ts()),
-                        peers: None,
-                    };
-                    broadcast(receivers_to_notify, &joined_message);
-                }
-                "offer" | "answer" | "ice_candidate" => {
-                    let Some(room_id) = signal.room_id.clone() else {
-                        continue;
-                    };
-                    let Some(target_peer_id) = signal.target_peer_id.clone() else {
-                        continue;
-                    };
-                    let target = {
-                        let rooms = state.rooms.read().await;
-                        rooms
-                            .get(&room_id)
-                            .and_then(|room| room.get(&target_peer_id))
-                            .map(|peer| peer.tx.clone())
-                    };
-                    if let Some(target_tx) = target {
-                        send_to_one(&target_tx, &signal);
+                        send_to_one(&tx, &joined_message);
                     }
-                }
-                "chat" => {
-                    let Some(room_id) = signal.room_id.clone() else {
-                        continue;
-                    };
-                    let Some(sender_peer_id) = signal.peer_id.clone() else {
-                        continue;
-                    };
-
-                    let receivers = {
-                        let rooms = state.rooms.read().await;
-                        rooms
-                            .get(&room_id)
-                            .map(|room| {
-                                room.iter()
-                                    .filter(|(id, _)| *id != &sender_peer_id)
-                                    .map(|(_, peer)| peer.tx.clone())
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
-                    };
-
-                    broadcast(receivers, &signal);
-                }
-                "leave" => {
-                    if let (Some(room_id), Some(peer_id)) =
-                        (signal.room_id.clone(), signal.peer_id.clone())
-                    {
-                        disconnect_peer(&state, room_id, peer_id).await;
+                    "offer" | "answer" | "ice_candidate" => {
+                        let Some(room_id) = signal.room_id.clone() else { continue; };
+                        let Some(target_peer_id) = signal.target_peer_id.clone() else { continue; };
+                        let target = {
+                            let rooms = state.rooms.read().await;
+                            rooms.get(&room_id).and_then(|room| room.get(&target_peer_id)).map(|peer| peer.tx.clone())
+                        };
+                        if let Some(target) = target { send_to_one(&target, &signal); }
                     }
+                    "chat" => {
+                        let Some(room_id) = signal.room_id.clone() else { continue; };
+                        let Some(sender_peer_id) = signal.peer_id.clone() else { continue; };
+                        let receivers = {
+                            let rooms = state.rooms.read().await;
+                            rooms.get(&room_id)
+                                .map(|room| room.iter().filter(|(id, _)| *id != &sender_peer_id).map(|(_, p)| p.tx.clone()).collect::<Vec<_>>())
+                                .unwrap_or_default()
+                        };
+                        broadcast(receivers, &signal);
+                    }
+                    "leave" => {
+                        if let (Some(room_id), Some(peer_id)) = (signal.room_id.clone(), signal.peer_id.clone()) {
+                            disconnect_peer(&state, room_id, peer_id).await;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            Message::Close(_) => break,
+            _ => {}
         }
     }
 
     if let (Some(room_id), Some(peer_id)) = (current_room_id, current_peer_id) {
         disconnect_peer(&state, room_id, peer_id).await;
     }
+
+    writer.abort();
 }
 
 async fn disconnect_peer(state: &AppState, room_id: String, peer_id: String) {
     let receivers = {
         let mut rooms = state.rooms.write().await;
-        let Some(room) = rooms.get_mut(&room_id) else {
-            return;
-        };
-
+        let Some(room) = rooms.get_mut(&room_id) else { return; };
         room.remove(&peer_id);
-
         let receivers = room.values().map(|peer| peer.tx.clone()).collect::<Vec<_>>();
-
-        if room.is_empty() {
-            rooms.remove(&room_id);
-        }
-
+        if room.is_empty() { rooms.remove(&room_id); }
         receivers
     };
 
@@ -1232,225 +858,31 @@ fn broadcast(targets: Vec<Tx>, message: &SignalMessage) {
     }
 }
 
-fn to_public_user(user: &UserRecord) -> PublicUserResponse {
-    PublicUserResponse {
-        public_id: user.public_id.clone(),
-        display_name: display_name_of(user),
-        first_name: user.first_name.clone(),
-        last_name: user.last_name.clone(),
-        phone: user.phone.clone(),
-        about: user.about.clone(),
-        created_at: user.created_at,
-        updated_at: user.updated_at,
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let expected = state
+        .admin_token
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| ApiError::NotFound("ADMIN_TOKEN не настроен на сервере".to_string()))?;
+    let actual = headers
+        .get("x-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("Нужен заголовок x-admin-token".to_string()))?;
+    if actual != expected {
+        return Err(ApiError::Conflict("Неверный admin token".to_string()));
     }
-}
-
-fn to_device_response(device: &DeviceRecord) -> DeviceResponse {
-    DeviceResponse {
-        device_id: device.device_id.clone(),
-        owner_public_id: device.owner_public_id.clone(),
-        platform: device.platform.clone(),
-        created_at: device.created_at,
-        updated_at: device.updated_at,
-    }
-}
-
-fn to_friend_request_view(db: &AppDb, item: &FriendRequestRecord) -> FriendRequestView {
-    let from_display_name = db
-        .users
-        .get(&item.from_public_id)
-        .map(display_name_of)
-        .unwrap_or_else(|| item.from_public_id.clone());
-
-    let to_display_name = db
-        .users
-        .get(&item.to_public_id)
-        .map(display_name_of)
-        .unwrap_or_else(|| item.to_public_id.clone());
-
-    FriendRequestView {
-        id: item.id.clone(),
-        from_public_id: item.from_public_id.clone(),
-        from_display_name,
-        to_public_id: item.to_public_id.clone(),
-        to_display_name,
-        status: item.status.clone(),
-        created_at: item.created_at,
-        responded_at: item.responded_at,
-    }
-}
-
-fn to_call_invite_view(item: &CallInviteRecord) -> CallInviteView {
-    CallInviteView {
-        id: item.id.clone(),
-        caller_public_id: item.caller_public_id.clone(),
-        caller_display_name: item.caller_display_name.clone(),
-        callee_public_id: item.callee_public_id.clone(),
-        callee_display_name: item.callee_display_name.clone(),
-        room_id: item.room_id.clone(),
-        status: item.status.clone(),
-        created_at: item.created_at,
-        responded_at: item.responded_at,
-    }
-}
-
-fn collect_friends(db: &AppDb, public_id: &str) -> Vec<FriendUserView> {
-    let mut result = Vec::new();
-
-    for item in &db.friendships {
-        let other = if item.user_a_public_id == public_id {
-            Some(item.user_b_public_id.clone())
-        } else if item.user_b_public_id == public_id {
-            Some(item.user_a_public_id.clone())
-        } else {
-            None
-        };
-
-        if let Some(other_public_id) = other {
-            if let Some(user) = db.users.get(&other_public_id) {
-                let (is_online, last_seen_at) = user_presence_info(db, &other_public_id);
-
-                result.push(FriendUserView {
-                    public_id: user.public_id.clone(),
-                    display_name: display_name_of(user),
-                    about: user.about.clone(),
-                    is_online,
-                    last_seen_at,
-                });
-            }
-        }
-    }
-
-    result.sort_by(|a, b| a.display_name.cmp(&b.display_name));
-    result
-}
-
-fn user_presence_info(db: &AppDb, public_id: &str) -> (bool, Option<i64>) {
-    let mut last_seen_at: Option<i64> = None;
-
-    for presence in db.presences.values() {
-        if presence.owner_public_id == public_id {
-            last_seen_at = match last_seen_at {
-                Some(current) => Some(current.max(presence.last_seen_at)),
-                None => Some(presence.last_seen_at),
-            };
-        }
-    }
-
-    let now = now_ts();
-    let is_online = match last_seen_at {
-        Some(value) => now - value <= PRESENCE_ONLINE_WINDOW_MS,
-        None => false,
-    };
-
-    (is_online, last_seen_at)
-}
-
-fn normalize_id(value: &str) -> String {
-    value.trim().to_uppercase()
-}
-
-fn display_name_of(user: &UserRecord) -> String {
-    let full = format!("{} {}", user.first_name.trim(), user.last_name.trim())
-        .trim()
-        .to_string();
-
-    if full.is_empty() {
-        "Пользователь".to_string()
-    } else {
-        full
-    }
-}
-
-fn sort_two_ids(a: &str, b: &str) -> (String, String) {
-    let mut ids = [a.to_string(), b.to_string()];
-    ids.sort();
-    (ids[0].clone(), ids[1].clone())
-}
-
-fn are_friends(friendships: &[FriendshipRecord], a: &str, b: &str) -> bool {
-    let (left, right) = sort_two_ids(a, b);
-
-    friendships.iter().any(|item| {
-        item.user_a_public_id == left && item.user_b_public_id == right
-    })
-}
-
-fn build_direct_chat_id(a: &str, b: &str) -> String {
-    let (left, right) = sort_two_ids(a, b);
-    format!("{left}__{right}")
-}
-
-fn build_direct_room_id(a: &str, b: &str) -> String {
-    let chat_id = build_direct_chat_id(a, b);
-    format!("dm_{chat_id}")
-}
-
-fn expire_stale_call_invites(db: &mut AppDb) {
-    let now = now_ts();
-
-    for item in db.call_invites.values_mut() {
-        if item.status == "pending" && now - item.created_at > CALL_INVITE_TTL_MS {
-            item.status = "expired".to_string();
-            item.responded_at = Some(now);
-        }
-    }
-}
-
-fn generate_entity_id(prefix: &str) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut rng = rand::rng();
-
-    let suffix = (0..8)
-        .map(|_| {
-            let index = rng.random_range(0..ALPHABET.len());
-            ALPHABET[index] as char
-        })
-        .collect::<String>();
-
-    format!("{prefix}-{suffix}")
-}
-
-async fn load_db(path: &PathBuf) -> AppDb {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-
-    if !path.exists() {
-        return AppDb::default();
-    }
-
-    match tokio::fs::read_to_string(path).await {
-        Ok(content) => serde_json::from_str::<AppDb>(&content).unwrap_or_default(),
-        Err(_) => AppDb::default(),
-    }
-}
-
-async fn persist_db(state: &AppState) -> Result<(), ApiError> {
-    let snapshot = { state.db.read().await.clone() };
-
-    if let Some(parent) = state.data_file.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Не удалось создать data dir: {e}")))?;
-    }
-
-    let payload = serde_json::to_string_pretty(&snapshot)
-        .map_err(|e| ApiError::Internal(format!("Не удалось сериализовать БД: {e}")))?;
-
-    tokio::fs::write(&*state.data_file, payload)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Не удалось сохранить БД: {e}")))?;
-
     Ok(())
+}
+
+fn sanitize_header_value(value: &str) -> String {
+    value.chars()
+        .map(|ch| if ch == "\\".chars().next().unwrap() || ch == "\r".chars().next().unwrap() || ch == "\n".chars().next().unwrap() { "_".chars().next().unwrap() } else { ch })
+        .collect()
 }
 
 fn now_ts() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-
-    duration.as_millis() as i64
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or_default()
 }

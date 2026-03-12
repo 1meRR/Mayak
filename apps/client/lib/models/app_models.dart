@@ -221,6 +221,39 @@ class UserProfile {
   }
 }
 
+class RecoveryCodeView {
+  final String code;
+  final bool isUsed;
+  final DateTime createdAt;
+  final DateTime? usedAt;
+
+  const RecoveryCodeView({
+    required this.code,
+    required this.isUsed,
+    required this.createdAt,
+    required this.usedAt,
+  });
+
+  factory RecoveryCodeView.fromJson(Map<String, dynamic> json) {
+    return RecoveryCodeView(
+      code: json['code'] as String? ?? '',
+      isUsed: json['isUsed'] as bool? ?? false,
+      createdAt: _parseDateTime(json['createdAt']),
+      usedAt: json['usedAt'] == null ? null : _parseDateTime(json['usedAt']),
+    );
+  }
+}
+
+class AuthRegisterResult {
+  final UserProfile profile;
+  final List<RecoveryCodeView> recoveryCodes;
+
+  const AuthRegisterResult({
+    required this.profile,
+    required this.recoveryCodes,
+  });
+}
+
 class FriendUser {
   final String publicId;
   final String displayName;

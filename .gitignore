@@ -1,0 +1,39 @@
+# Rust
+target/
+**/target/
+Cargo.lock
+
+# Runtime data
+data/
+media/
+*.log
+*.sqlite
+*.db
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Flutter / Dart
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Android
+**/android/.gradle/
+**/android/app/build/
+
+# iOS
+**/ios/Pods/
+**/ios/.symlinks/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Local helper dumps
+project_dump.txt

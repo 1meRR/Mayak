@@ -53,6 +53,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
   }
 
   ApiService _apiFor(UserProfile profile) => ApiService(profile.serverUrl);
+  ApiService _apiForServer(String serverUrl) => ApiService(serverUrl);
 
   Future<void> _reload() async {
     setState(() {
@@ -63,7 +64,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
     try {
       var profile = await _settings.ensureProfile();
 
-      if (profile.registered && profile.firstName.trim().isNotEmpty) {
+      if (_isAuthenticated(profile)) {
         final api = _apiFor(profile);
         profile = await api.registerUser(profile);
         await _settings.saveProfile(profile);
@@ -105,10 +106,16 @@ class _AppShellScreenState extends State<AppShellScreen> {
     }
   }
 
+  bool _isAuthenticated(UserProfile profile) {
+    return profile.registered &&
+        profile.publicId.trim().isNotEmpty &&
+        profile.firstName.trim().isNotEmpty;
+  }
+
   Future<void> _backgroundSync() async {
     final profile = _profile;
     if (!mounted || profile == null) return;
-    if (!profile.registered || profile.firstName.trim().isEmpty) return;
+    if (!_isAuthenticated(profile)) return;
     if (_syncing) return;
 
     _syncing = true;
@@ -138,25 +145,100 @@ class _AppShellScreenState extends State<AppShellScreen> {
     }
   }
 
-  Future<void> _completeRegistration({
+  Future<AuthRegisterResult> _register({
     required String firstName,
     required String lastName,
     required String phone,
+    required String password,
+    required String serverUrl,
   }) async {
-    var profile = await _settings.completeRegistration(
+    final localProfile = await _settings.ensureProfile();
+    final api = _apiForServer(serverUrl);
+
+    final result = await api.registerWithPhone(
+      deviceId: localProfile.deviceId,
       firstName: firstName,
       lastName: lastName,
       phone: phone,
+      password: password,
+      about: localProfile.about,
     );
 
-    profile = await _apiFor(profile).registerUser(profile);
-    await _settings.saveProfile(profile);
+    final savedProfile = result.profile.copyWith(
+      deviceId: localProfile.deviceId,
+      serverUrl: serverUrl,
+      createdAt: localProfile.createdAt,
+      about: localProfile.about,
+      registered: true,
+    );
+
+    await _settings.saveProfile(savedProfile);
+    await _reload();
+
+    if (!mounted) return AuthRegisterResult(profile: savedProfile, recoveryCodes: result.recoveryCodes);
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Аккаунт создан, контакты теперь привязаны к аккаунту')),
+    );
+
+    return AuthRegisterResult(
+      profile: savedProfile,
+      recoveryCodes: result.recoveryCodes,
+    );
+  }
+
+  Future<void> _login({
+    required String phone,
+    required String password,
+    required String serverUrl,
+  }) async {
+    final localProfile = await _settings.ensureProfile();
+    final api = _apiForServer(serverUrl);
+
+    final profile = await api.loginWithPhone(
+      deviceId: localProfile.deviceId,
+      phone: phone,
+      password: password,
+    );
+
+    await _settings.saveProfile(
+      profile.copyWith(
+        deviceId: localProfile.deviceId,
+        serverUrl: serverUrl,
+        createdAt: localProfile.createdAt,
+        registered: true,
+      ),
+    );
+
     await _reload();
 
     if (!mounted) return;
-
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Регистрация завершена и отправлена на сервер')),
+      const SnackBar(content: Text('Вход выполнен, профиль восстановлен')),
+    );
+  }
+
+  Future<void> _resetPassword({
+    required String phone,
+    required String recoveryCode,
+    required String newPassword,
+    required String serverUrl,
+  }) async {
+    final api = _apiForServer(serverUrl);
+    await api.resetPasswordWithCode(
+      phone: phone,
+      recoveryCode: recoveryCode,
+      newPassword: newPassword,
+    );
+  }
+
+  Future<void> _logout() async {
+    await _settings.clearSession();
+    await _reload();
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Локальная сессия удалена')),
     );
   }
 
@@ -164,7 +246,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
     await _settings.saveProfile(updated);
 
     final synced = await _apiFor(updated).registerUser(updated);
-    await _settings.saveProfile(synced);
+    await _settings.saveProfile(synced.copyWith(serverUrl: updated.serverUrl));
     await _reload();
 
     if (!mounted) return;
@@ -361,10 +443,12 @@ class _AppShellScreenState extends State<AppShellScreen> {
       );
     }
 
-    if (!profile.registered || profile.firstName.trim().isEmpty) {
+    if (!_isAuthenticated(profile)) {
       return OnboardingScreen(
         profile: profile,
-        onComplete: _completeRegistration,
+        onRegister: _register,
+        onLogin: _login,
+        onResetPassword: _resetPassword,
       );
     }
 
@@ -389,6 +473,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
       ProfileScreen(
         profile: profile,
         onSave: _saveProfile,
+        onLogout: _logout,
       ),
     ];
 
