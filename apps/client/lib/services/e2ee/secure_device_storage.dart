@@ -83,6 +83,35 @@ class SecureDeviceStorage {
     );
   }
 
+  Future<Map<String, dynamic>> readAllForDevice({
+    required String publicId,
+    required String deviceId,
+    required String prefix,
+  }) async {
+    final all = await _storage.readAll();
+    final scopedPrefix =
+        '$_namespace:${publicId.trim().toUpperCase()}:${deviceId.trim().toUpperCase()}:$prefix';
+
+    final result = <String, dynamic>{};
+    for (final entry in all.entries) {
+      if (!entry.key.startsWith(scopedPrefix)) {
+        continue;
+      }
+      final value = entry.value;
+      if (value == null || value.trim().isEmpty) {
+        continue;
+      }
+      try {
+        final decoded = jsonDecode(value);
+        result[entry.key] = decoded;
+      } catch (_) {
+        result[entry.key] = value;
+      }
+    }
+
+    return result;
+  }
+
   Future<void> deleteAllForDevice({
     required String publicId,
     required String deviceId,

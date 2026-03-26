@@ -1,4 +1,3 @@
-@'
 import 'dart:async';
 
 import 'package:flutter/services.dart';
@@ -22,8 +21,7 @@ class NativeCryptoBridge implements CryptoBridge {
     try {
       final raw = await _channel.invokeMethod<dynamic>('getStatus');
       if (raw is Map) {
-        final map =
-            raw.map((key, value) => MapEntry(key.toString(), value));
+        final map = raw.map((key, value) => MapEntry(key.toString(), value));
         return CryptoBridgeStatus(
           available: map['available'] == true,
           backend: map['backend']?.toString() ?? _backendName,
@@ -196,4 +194,3 @@ class NativeCryptoBridge implements CryptoBridge {
     }
   }
 }
-'@ | Set-Content -Path "E:\VSCODE\decentra_call_messenger\apps\client\lib\services\e2ee\native_crypto_bridge.dart" -Encoding UTF8

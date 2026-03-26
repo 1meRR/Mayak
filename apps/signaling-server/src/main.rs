@@ -1,7 +1,8 @@
-﻿mod domain;
+mod domain;
 mod storage;
 
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
@@ -37,8 +38,9 @@ struct AppState {
 async fn main() {
     init_tracing();
 
-    let database_url = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/decentra_call".to_string());
+    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@localhost:5432/decentra_call".to_string()
+    });
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
     let pool = PgPoolOptions::new()
@@ -65,6 +67,11 @@ async fn main() {
         .route("/v1/files", post(create_file_object))
         .route("/v1/files/{file_id}/complete", post(complete_file_object))
         .route("/v1/files/{file_id}", get(get_file_for_device))
+        .route(
+            "/v1/files/{file_id}/chunks/{chunk_index}",
+            post(upload_file_chunk),
+        )
+        .route("/v1/files/{file_id}/content", get(download_file_content))
         .route("/v1/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -94,23 +101,22 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-async fn register(
-    State(state): State<AppState>,
-    Json(req): Json<RegisterRequest>,
-) -> Response {
+async fn register(State(state): State<AppState>, Json(req): Json<RegisterRequest>) -> Response {
     match state.store.register_user(req).await {
         Ok(profile) => (StatusCode::CREATED, Json(profile)).into_response(),
         Err(err) => error_response(StatusCode::BAD_REQUEST, err),
     }
 }
 
-async fn login(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> Response {
+async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
     match state
         .store
-        .login_user(&req.phone_e164, &req.password, &req.device_id, &req.platform)
+        .login_user(
+            &req.phone_e164,
+            &req.password,
+            &req.device_id,
+            &req.platform,
+        )
         .await
     {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
@@ -147,7 +153,8 @@ async fn upsert_device_key_package(
     headers: HeaderMap,
     Json(req): Json<UpsertDeviceKeyPackageRequest>,
 ) -> Response {
-    let auth = match authenticate_from_headers(&state, &headers, Some(req.device_id.clone())).await {
+    let auth = match authenticate_from_headers(&state, &headers, Some(req.device_id.clone())).await
+    {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -163,7 +170,9 @@ async fn send_encrypted_messages(
     headers: HeaderMap,
     Json(req): Json<SendEncryptedMessageRequest>,
 ) -> Response {
-    let auth = match authenticate_from_headers(&state, &headers, Some(req.sender_device_id.clone())).await {
+    let auth = match authenticate_from_headers(&state, &headers, Some(req.sender_device_id.clone()))
+        .await
+    {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -195,10 +204,11 @@ async fn get_pending_messages(
     headers: HeaderMap,
     Query(query): Query<PendingMessagesQuery>,
 ) -> Response {
-    let auth = match authenticate_from_headers(&state, &headers, Some(query.device_id.clone())).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let auth =
+        match authenticate_from_headers(&state, &headers, Some(query.device_id.clone())).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     match state
@@ -217,7 +227,8 @@ async fn ack_envelope(
     Path(envelope_id): Path<String>,
     Json(req): Json<AckEnvelopeRequest>,
 ) -> Response {
-    let auth = match authenticate_from_headers(&state, &headers, Some(req.device_id.clone())).await {
+    let auth = match authenticate_from_headers(&state, &headers, Some(req.device_id.clone())).await
+    {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -237,10 +248,13 @@ async fn create_file_object(
     headers: HeaderMap,
     Json(req): Json<CreateFileObjectRequest>,
 ) -> Response {
-    let auth = match authenticate_from_headers(&state, &headers, Some(req.uploader_device_id.clone())).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let auth =
+        match authenticate_from_headers(&state, &headers, Some(req.uploader_device_id.clone()))
+            .await
+        {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
     match state.store.create_file_object(&auth, req).await {
         Ok(file) => (StatusCode::CREATED, Json(file)).into_response(),
@@ -295,6 +309,107 @@ async fn get_file_for_device(
     }
 }
 
+async fn upload_file_chunk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((file_id, chunk_index)): Path<(String, i32)>,
+    body: Bytes,
+) -> Response {
+    let device_id = match required_header_string(&headers, "x-device-id") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let auth = match authenticate_from_headers(&state, &headers, Some(device_id)).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    if body.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "chunk body is empty");
+    }
+
+    match state.store.ensure_file_uploader(&auth, &file_id).await {
+        Ok(_) => {}
+        Err(err) => return error_response(StatusCode::FORBIDDEN, err),
+    }
+
+    let base_dir = env::var("FILE_STORAGE_DIR").unwrap_or_else(|_| "./file_storage".to_string());
+    let file_dir = format!("{}/{}", base_dir, file_id.trim());
+
+    if let Err(err) = tokio::fs::create_dir_all(&file_dir).await {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+
+    let path = format!("{}/chunk_{:06}.bin", file_dir, chunk_index);
+    if let Err(err) = tokio::fs::write(&path, &body).await {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(json!({"ok": true, "chunkIndex": chunk_index})),
+    )
+        .into_response()
+}
+
+async fn download_file_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(file_id): Path<String>,
+) -> Response {
+    let device_id = match required_header_string(&headers, "x-device-id") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let auth = match authenticate_from_headers(&state, &headers, Some(device_id)).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    match state.store.ensure_file_downloadable(&auth, &file_id).await {
+        Ok(_) => {}
+        Err(err) => return error_response(StatusCode::FORBIDDEN, err),
+    }
+
+    let base_dir = env::var("FILE_STORAGE_DIR").unwrap_or_else(|_| "./file_storage".to_string());
+    let file_dir = format!("{}/{}", base_dir, file_id.trim());
+
+    let mut entries = match tokio::fs::read_dir(&file_dir).await {
+        Ok(v) => v,
+        Err(err) => return error_response(StatusCode::NOT_FOUND, err.to_string()),
+    };
+
+    let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(item)) => {
+                let name = item.file_name().to_string_lossy().to_string();
+                if !name.starts_with("chunk_") {
+                    continue;
+                }
+                match tokio::fs::read(item.path()).await {
+                    Ok(bytes) => parts.push((name, bytes)),
+                    Err(err) => {
+                        return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    }
+
+    parts.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged = Vec::<u8>::new();
+    for (_, part) in parts {
+        merged.extend_from_slice(&part);
+    }
+
+    (StatusCode::OK, merged).into_response()
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -303,7 +418,12 @@ async fn ws_handler(
 ) -> Response {
     let device_id = match query.get("deviceId") {
         Some(v) => v.clone(),
-        None => return error_response(StatusCode::BAD_REQUEST, "deviceId query parameter is required"),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "deviceId query parameter is required",
+            )
+        }
     };
 
     let auth = match authenticate_from_headers(&state, &headers, Some(device_id)).await {
@@ -380,7 +500,12 @@ async fn authenticate_from_headers(
 ) -> Result<AuthenticatedDevice, Response> {
     let bearer = match bearer_token(headers) {
         Some(v) => v,
-        None => return Err(error_response(StatusCode::UNAUTHORIZED, "Missing Bearer token")),
+        None => {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Missing Bearer token",
+            ))
+        }
     };
 
     let device_id = match explicit_device_id {
@@ -417,10 +542,7 @@ fn required_header_string(headers: &HeaderMap, header_name: &str) -> Result<Stri
         })
 }
 
-async fn notify_pending(
-    state: &AppState,
-    stored: &[crate::domain::models::StoredEnvelopeView],
-) {
+async fn notify_pending(state: &AppState, stored: &[crate::domain::models::StoredEnvelopeView]) {
     let guard = state.online_devices.read().await;
 
     for item in stored {
@@ -450,5 +572,11 @@ fn online_key(public_id: &str, device_id: &str) -> String {
 }
 
 fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
-    (status, Json(ErrorResponse { error: error.into() })).into_response()
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.into(),
+        }),
+    )
+        .into_response()
 }
