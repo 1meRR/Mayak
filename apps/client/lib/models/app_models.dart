@@ -135,11 +135,27 @@ DateTime _parseDateTime(dynamic value) {
   return DateTime.now();
 }
 
+DateTime? _parseNullableDateTime(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+  return _parseDateTime(value);
+}
+
 int _toMillis(DateTime value) => value.millisecondsSinceEpoch;
+
+List<String> _toStringList(dynamic raw) {
+  if (raw is! List) {
+    return const [];
+  }
+  return raw.map((item) => item.toString()).toList();
+}
 
 class UserProfile {
   final String publicId;
+  final String friendCode;
   final String deviceId;
+  final String sessionToken;
   final String firstName;
   final String lastName;
   final String phone;
@@ -150,7 +166,9 @@ class UserProfile {
 
   const UserProfile({
     required this.publicId,
+    required this.friendCode,
     required this.deviceId,
+    required this.sessionToken,
     required this.firstName,
     required this.lastName,
     required this.phone,
@@ -165,12 +183,26 @@ class UserProfile {
         .where((item) => item.isNotEmpty)
         .join(' ')
         .trim();
-    return full.isEmpty ? 'Пользователь' : full;
+    if (full.isNotEmpty) {
+      return full;
+    }
+    if (publicId.trim().isNotEmpty) {
+      return publicId.trim();
+    }
+    return 'Пользователь';
   }
+
+  bool get hasActiveSession =>
+      registered &&
+      publicId.trim().isNotEmpty &&
+      deviceId.trim().isNotEmpty &&
+      sessionToken.trim().isNotEmpty;
 
   UserProfile copyWith({
     String? publicId,
+    String? friendCode,
     String? deviceId,
+    String? sessionToken,
     String? firstName,
     String? lastName,
     String? phone,
@@ -181,7 +213,9 @@ class UserProfile {
   }) {
     return UserProfile(
       publicId: publicId ?? this.publicId,
+      friendCode: friendCode ?? this.friendCode,
       deviceId: deviceId ?? this.deviceId,
+      sessionToken: sessionToken ?? this.sessionToken,
       firstName: firstName ?? this.firstName,
       lastName: lastName ?? this.lastName,
       phone: phone ?? this.phone,
@@ -195,7 +229,9 @@ class UserProfile {
   factory UserProfile.fromJson(Map<String, dynamic> json) {
     return UserProfile(
       publicId: json['publicId'] as String? ?? '',
+      friendCode: json['friendCode'] as String? ?? '',
       deviceId: json['deviceId'] as String? ?? '',
+      sessionToken: json['sessionToken'] as String? ?? '',
       firstName: json['firstName'] as String? ?? '',
       lastName: json['lastName'] as String? ?? '',
       phone: json['phone'] as String? ?? '',
@@ -209,7 +245,9 @@ class UserProfile {
   Map<String, dynamic> toJson() {
     return {
       'publicId': publicId,
+      'friendCode': friendCode,
       'deviceId': deviceId,
+      'sessionToken': sessionToken,
       'firstName': firstName,
       'lastName': lastName,
       'phone': phone,
@@ -239,7 +277,7 @@ class RecoveryCodeView {
       code: json['code'] as String? ?? '',
       isUsed: json['isUsed'] as bool? ?? false,
       createdAt: _parseDateTime(json['createdAt']),
-      usedAt: json['usedAt'] == null ? null : _parseDateTime(json['usedAt']),
+      usedAt: _parseNullableDateTime(json['usedAt']),
     );
   }
 }
@@ -256,6 +294,7 @@ class AuthRegisterResult {
 
 class FriendUser {
   final String publicId;
+  final String friendCode;
   final String displayName;
   final String about;
   final DateTime createdAt;
@@ -264,6 +303,7 @@ class FriendUser {
 
   const FriendUser({
     required this.publicId,
+    required this.friendCode,
     required this.displayName,
     required this.about,
     required this.createdAt,
@@ -274,18 +314,19 @@ class FriendUser {
   factory FriendUser.fromJson(Map<String, dynamic> json) {
     return FriendUser(
       publicId: json['publicId'] as String? ?? '',
+      friendCode: json['friendCode'] as String? ?? '',
       displayName: json['displayName'] as String? ?? 'Друг',
       about: json['about'] as String? ?? '',
       createdAt: _parseDateTime(json['createdAt']),
       isOnline: json['isOnline'] as bool? ?? false,
-      lastSeenAt:
-          json['lastSeenAt'] == null ? null : _parseDateTime(json['lastSeenAt']),
+      lastSeenAt: _parseNullableDateTime(json['lastSeenAt']),
     );
   }
 
   Map<String, dynamic> toJson() {
     return {
       'publicId': publicId,
+      'friendCode': friendCode,
       'displayName': displayName,
       'about': about,
       'createdAt': _toMillis(createdAt),
@@ -318,29 +359,15 @@ class FriendRequestView {
 
   factory FriendRequestView.fromJson(Map<String, dynamic> json) {
     return FriendRequestView(
-      id: json['id'] as String? ?? '',
+      id: json['id'] as String? ?? json['requestId'] as String? ?? '',
       fromPublicId: json['fromPublicId'] as String? ?? '',
       fromDisplayName: json['fromDisplayName'] as String? ?? '',
       toPublicId: json['toPublicId'] as String? ?? '',
       toDisplayName: json['toDisplayName'] as String? ?? '',
       status: json['status'] as String? ?? 'pending',
       createdAt: _parseDateTime(json['createdAt']),
-      respondedAt:
-          json['respondedAt'] == null ? null : _parseDateTime(json['respondedAt']),
+      respondedAt: _parseNullableDateTime(json['respondedAt']),
     );
-  }
-
-  Map<String, dynamic> toJson() {
-    return {
-      'id': id,
-      'fromPublicId': fromPublicId,
-      'fromDisplayName': fromDisplayName,
-      'toPublicId': toPublicId,
-      'toDisplayName': toDisplayName,
-      'status': status,
-      'createdAt': _toMillis(createdAt),
-      'respondedAt': respondedAt == null ? null : _toMillis(respondedAt!),
-    };
   }
 }
 
@@ -414,7 +441,7 @@ class FriendsBundle {
 }
 
 class CallInviteView {
-  final String id;
+  final String inviteId;
   final String callerPublicId;
   final String callerDisplayName;
   final String calleePublicId;
@@ -425,7 +452,7 @@ class CallInviteView {
   final DateTime? respondedAt;
 
   const CallInviteView({
-    required this.id,
+    required this.inviteId,
     required this.callerPublicId,
     required this.callerDisplayName,
     required this.calleePublicId,
@@ -436,9 +463,11 @@ class CallInviteView {
     required this.respondedAt,
   });
 
+  String get id => inviteId;
+
   factory CallInviteView.fromJson(Map<String, dynamic> json) {
     return CallInviteView(
-      id: json['id'] as String? ?? '',
+      inviteId: json['inviteId'] as String? ?? json['id'] as String? ?? '',
       callerPublicId: json['callerPublicId'] as String? ?? '',
       callerDisplayName: json['callerDisplayName'] as String? ?? '',
       calleePublicId: json['calleePublicId'] as String? ?? '',
@@ -446,8 +475,7 @@ class CallInviteView {
       roomId: json['roomId'] as String? ?? '',
       status: json['status'] as String? ?? 'pending',
       createdAt: _parseDateTime(json['createdAt']),
-      respondedAt:
-          json['respondedAt'] == null ? null : _parseDateTime(json['respondedAt']),
+      respondedAt: _parseNullableDateTime(json['respondedAt']),
     );
   }
 }
@@ -511,20 +539,95 @@ class DirectMessage {
   }
 }
 
-class DirectChat {
+class PendingOutgoingMessage {
+  final String messageId;
   final String chatId;
   final String peerPublicId;
-  final String peerDisplayName;
-  final String previewText;
-  final DateTime? updatedAt;
-  final int unreadCount;
+  final String? peerDeviceId;
+  final String authorPublicId;
+  final String authorDisplayName;
+  final String text;
+  final DateTime createdAt;
+  final String status;
+  final String? envelopeId;
+  final int retryCount;
+  final DateTime? nextRetryAt;
+  final String? lastError;
 
-  const DirectChat({
+  const PendingOutgoingMessage({
+    required this.messageId,
     required this.chatId,
     required this.peerPublicId,
-    required this.peerDisplayName,
-    required this.previewText,
-    required this.updatedAt,
-    required this.unreadCount,
+    required this.peerDeviceId,
+    required this.authorPublicId,
+    required this.authorDisplayName,
+    required this.text,
+    required this.createdAt,
+    required this.status,
+    required this.envelopeId,
+    required this.retryCount,
+    required this.nextRetryAt,
+    required this.lastError,
   });
+}
+
+class DeviceSignalMessage {
+  final String type;
+  final String? fromPublicId;
+  final String? fromDeviceId;
+  final String? toPublicId;
+  final String? toDeviceId;
+  final String? channel;
+  final String? envelopeId;
+  final String? ackForEnvelopeId;
+  final Map<String, dynamic>? payload;
+  final int? timestamp;
+
+  const DeviceSignalMessage({
+    required this.type,
+    this.fromPublicId,
+    this.fromDeviceId,
+    this.toPublicId,
+    this.toDeviceId,
+    this.channel,
+    this.envelopeId,
+    this.ackForEnvelopeId,
+    this.payload,
+    this.timestamp,
+  });
+
+  factory DeviceSignalMessage.fromJson(Map<String, dynamic> json) {
+    final rawPayload = json['payload'];
+    final payload = rawPayload is Map
+        ? rawPayload.map((key, value) => MapEntry(key.toString(), value))
+        : null;
+
+    return DeviceSignalMessage(
+      type: json['type'] as String? ?? '',
+      fromPublicId: json['fromPublicId'] as String?,
+      fromDeviceId: json['fromDeviceId'] as String?,
+      toPublicId: json['toPublicId'] as String?,
+      toDeviceId: json['toDeviceId'] as String?,
+      channel: json['channel'] as String?,
+      envelopeId: json['envelopeId'] as String?,
+      ackForEnvelopeId: json['ackForEnvelopeId'] as String?,
+      payload: payload,
+      timestamp: json['timestamp'] as int?,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'type': type,
+      if (fromPublicId != null) 'fromPublicId': fromPublicId,
+      if (fromDeviceId != null) 'fromDeviceId': fromDeviceId,
+      if (toPublicId != null) 'toPublicId': toPublicId,
+      if (toDeviceId != null) 'toDeviceId': toDeviceId,
+      if (channel != null) 'channel': channel,
+      if (envelopeId != null) 'envelopeId': envelopeId,
+      if (ackForEnvelopeId != null) 'ackForEnvelopeId': ackForEnvelopeId,
+      if (payload != null) 'payload': payload,
+      if (timestamp != null) 'timestamp': timestamp,
+    };
+  }
 }

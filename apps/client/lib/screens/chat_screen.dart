@@ -1,198 +1,273 @@
+﻿@'
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 
 import '../models/app_models.dart';
-import '../services/api_service.dart';
-import '../services/settings_repository.dart';
-import '../widgets/glass_panel.dart';
-import 'outgoing_call_screen.dart';
+import '../services/e2ee/e2ee_message_service.dart';
+import '../services/local_message_store.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({
     super.key,
     required this.profile,
     required this.friend,
+    required this.store,
+    required this.e2ee,
+    this.onSyncRequested,
   });
 
   final UserProfile profile;
   final FriendUser friend;
+  final LocalMessageStore store;
+  final E2eeMessageService e2ee;
+  final Future<void> Function()? onSyncRequested;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final TextEditingController _messageController = TextEditingController();
+  final TextEditingController _textController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
 
-  late final String _chatId;
-  late final ApiService _api;
+  Stream<List<DirectMessage>>? _messagesStream;
 
-  List<DirectMessage> _messages = const [];
-  bool _loading = true;
-  bool _sending = false;
-  bool _creatingInvite = false;
-  String? _error;
+  bool _isSending = false;
+  bool _isSyncing = false;
+  bool _bridgeReady = false;
+  String? _bridgeProblem;
 
-  Timer? _pollTimer;
-  bool _disposed = false;
+  String get _chatId => _buildChatId(
+        widget.profile.publicId,
+        widget.friend.publicId,
+      );
 
   @override
   void initState() {
     super.initState();
-    _chatId = SettingsRepository.buildDirectChatId(
-      widget.profile.publicId,
-      widget.friend.publicId,
-    );
-    _api = ApiService(widget.profile.serverUrl);
-
-    _loadMessages();
-
-    _pollTimer = Timer.periodic(
-      const Duration(seconds: 2),
-      (_) => _loadMessages(silent: true),
-    );
+    _messagesStream = widget.store.watchMessages(chatId: _chatId);
+    _initAsync();
   }
 
-  @override
-  void dispose() {
-    _disposed = true;
-    _pollTimer?.cancel();
-    _messageController.dispose();
-    super.dispose();
+  static String _buildChatId(String id1, String id2) {
+    final list = [
+      id1.trim().toUpperCase(),
+      id2.trim().toUpperCase(),
+    ]..sort();
+    return 'dm_${list.join('_')}';
   }
 
-  List<DirectMessage> _mergeMessages(List<DirectMessage> items) {
-    final map = <String, DirectMessage>{};
-
-    for (final item in items) {
-      map[item.id] = item;
-    }
-
-    final result = map.values.toList()
-      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
-
-    return result;
+  Future<void> _initAsync() async {
+    await _checkBridge();
+    await _syncNow();
   }
 
-  Future<void> _loadMessages({bool silent = false}) async {
-    if (_disposed) return;
+  Future<void> _checkBridge() async {
+    try {
+      final status = await widget.e2ee.getBridgeStatus();
+      if (!mounted) return;
 
-    if (!silent) {
       setState(() {
-        _loading = true;
-        _error = null;
+        _bridgeReady = status.available;
+        _bridgeProblem = status.available
+            ? null
+            : (status.reason ?? 'native crypto bridge is unavailable');
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _bridgeReady = false;
+        _bridgeProblem = e.toString();
       });
     }
+  }
+
+  Future<void> _syncNow() async {
+    if (_isSyncing) return;
+
+    setState(() {
+      _isSyncing = true;
+    });
 
     try {
-      final messages = await _api.fetchMessages(
-        chatId: _chatId,
-        myPublicId: widget.profile.publicId,
+      if (widget.onSyncRequested != null) {
+        await widget.onSyncRequested!.call();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ошибка синхронизации: $e')),
       );
-
-      if (!mounted || _disposed) return;
-
-      setState(() {
-        _messages = _mergeMessages(messages);
-        _loading = false;
-        _error = null;
-      });
-    } catch (error) {
-      if (!mounted || _disposed) return;
-
-      if (!silent) {
+    } finally {
+      if (mounted) {
         setState(() {
-          _loading = false;
-          _error = error.toString();
+          _isSyncing = false;
         });
       }
     }
   }
 
   Future<void> _sendMessage() async {
-    final text = _messageController.text.trim();
-    if (text.isEmpty || _sending) {
-      return;
-    }
+    final text = _textController.text.trim();
+    if (text.isEmpty || _isSending) return;
 
-    setState(() {
-      _sending = true;
-    });
-
-    try {
-      final sent = await _api.sendMessage(
-        fromPublicId: widget.profile.publicId,
-        toPublicId: widget.friend.publicId,
-        text: text,
-        authorDisplayName: widget.profile.displayName,
-      );
-
-      if (!mounted || _disposed) return;
-
-      _messageController.clear();
-      setState(() {
-        _messages = _mergeMessages([..._messages, sent]);
-      });
-
-      await _loadMessages(silent: true);
-    } catch (error) {
-      if (!mounted || _disposed) return;
+    if (!_bridgeReady) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Не удалось отправить сообщение: $error')),
-      );
-    } finally {
-      if (mounted && !_disposed) {
-        setState(() {
-          _sending = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _startVideoCall() async {
-    if (_creatingInvite) return;
-
-    setState(() {
-      _creatingInvite = true;
-    });
-
-    try {
-      final invite = await _api.createCallInvite(
-        callerPublicId: widget.profile.publicId,
-        calleePublicId: widget.friend.publicId,
-      );
-
-      if (!mounted || _disposed) return;
-
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => OutgoingCallScreen(
-            profile: widget.profile,
-            friend: widget.friend,
-            invite: invite,
-            api: _api,
+        SnackBar(
+          content: Text(
+            _bridgeProblem ??
+                'E2EE bridge недоступен. Нельзя отправлять plaintext через placeholder transport.',
           ),
         ),
       );
-    } catch (error) {
-      if (!mounted || _disposed) return;
+      return;
+    }
+
+    _textController.clear();
+    setState(() {
+      _isSending = true;
+    });
+
+    final optimistic = DirectMessage(
+      id: 'local_${DateTime.now().millisecondsSinceEpoch}',
+      chatId: _chatId,
+      authorPublicId: widget.profile.publicId,
+      authorDisplayName: widget.profile.displayName,
+      text: text,
+      createdAt: DateTime.now(),
+      isMine: true,
+      status: 'queued',
+    );
+
+    try {
+      await widget.store.upsertMessage(
+        peerPublicId: widget.friend.publicId,
+        message: optimistic,
+      );
+
+      final stored = await widget.e2ee.sendEncryptedText(
+        senderProfile: widget.profile,
+        friend: widget.friend,
+        plaintext: text,
+        clientMessageId: optimistic.id,
+      );
+
+      if (stored.isEmpty) {
+        throw Exception('Сервер не сохранил ни одного envelope');
+      }
+
+      final first = stored.first;
+
+      await widget.store.updateMessageStatus(
+        messageId: optimistic.id,
+        status: 'sent',
+        peerDeviceId: first.recipientDeviceId,
+        envelopeId: first.envelopeId,
+        deliveredAt: DateTime.now(),
+      );
+
+      await _syncNow();
+
+      if (!mounted) return;
+      _scrollToBottom();
+    } catch (e) {
+      await widget.store.updateMessageStatus(
+        messageId: optimistic.id,
+        status: 'failed',
+        lastError: e.toString(),
+        nextRetryAt: DateTime.now().add(const Duration(seconds: 30)),
+      );
+
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Не удалось начать звонок: $error')),
+        SnackBar(content: Text('Ошибка E2EE-отправки: $e')),
       );
     } finally {
-      if (mounted && !_disposed) {
+      if (mounted) {
         setState(() {
-          _creatingInvite = false;
+          _isSending = false;
         });
       }
     }
   }
 
-  String _formatTime(DateTime dateTime) {
-    final hh = dateTime.hour.toString().padLeft(2, '0');
-    final mm = dateTime.minute.toString().padLeft(2, '0');
-    return '$hh:$mm';
+  void _scrollToBottom() {
+    if (!_scrollController.hasClients) return;
+    _scrollController.animateTo(
+      _scrollController.position.maxScrollExtent,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+    );
+  }
+
+  String _formatTime(DateTime value) => DateFormat('HH:mm').format(value);
+
+  String _statusLabel(String status) {
+    switch (status) {
+      case 'queued':
+        return 'queued';
+      case 'sent':
+        return 'sent';
+      case 'delivered':
+        return 'delivered';
+      case 'acknowledged':
+        return 'acknowledged';
+      case 'failed':
+        return 'failed';
+      default:
+        return status;
+    }
+  }
+
+  Color _bubbleColor(ThemeData theme, DirectMessage message) {
+    if (message.isMine) {
+      switch (message.status) {
+        case 'failed':
+          return Colors.red.shade400;
+        case 'queued':
+          return Colors.orange.shade400;
+        default:
+          return theme.colorScheme.primary;
+      }
+    }
+
+    return const Color(0xFF1A2333);
+  }
+
+  Widget _buildBridgeBanner() {
+    if (_bridgeReady) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        color: Colors.green.shade700,
+        child: const Text(
+          'E2EE bridge active',
+          style: TextStyle(color: Colors.white, fontSize: 12),
+          textAlign: TextAlign.center,
+        ),
+      );
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      color: Colors.red.shade700,
+      child: Text(
+        _bridgeProblem ??
+            'E2EE bridge unavailable. Chat is fail-closed for sending.',
+        style: const TextStyle(color: Colors.white, fontSize: 12),
+        textAlign: TextAlign.center,
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    _scrollController.dispose();
+    super.dispose();
   }
 
   @override
@@ -201,182 +276,166 @@ class _ChatScreenState extends State<ChatScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.friend.displayName),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(widget.friend.displayName),
+            const Text(
+              'E2EE mailbox chat',
+              style: TextStyle(fontSize: 12, color: Colors.lightGreenAccent),
+            ),
+          ],
+        ),
         actions: [
           IconButton(
-            tooltip: 'Обновить',
-            onPressed: () => _loadMessages(),
-            icon: const Icon(Icons.refresh_rounded),
-          ),
-          IconButton(
-            tooltip: 'Видео-звонок',
-            onPressed: _creatingInvite ? null : _startVideoCall,
-            icon: _creatingInvite
+            icon: _isSyncing
                 ? const SizedBox(
                     width: 18,
                     height: 18,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Icon(Icons.videocam_rounded),
+                : const Icon(Icons.refresh_rounded),
+            onPressed: _isSyncing ? null : _syncNow,
+            tooltip: 'Синхронизировать',
           ),
         ],
       ),
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: RadialGradient(
-            center: Alignment.topLeft,
-            radius: 1.9,
-            colors: [
-              Color(0xFF18233A),
-              Color(0xFF0D1220),
-              Color(0xFF070B14),
-            ],
-          ),
-        ),
-        child: SafeArea(
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(18, 8, 18, 12),
-                child: GlassPanel(
-                  padding: const EdgeInsets.all(16),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          'ID: ${widget.friend.publicId}',
-                          style: theme.textTheme.bodyMedium,
-                        ),
-                      ),
-                      FilledButton.icon(
-                        onPressed: _creatingInvite ? null : _startVideoCall,
-                        icon: const Icon(Icons.videocam_rounded),
-                        label: const Text('Позвонить'),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              Expanded(
-                child: _loading
-                    ? const Center(child: CircularProgressIndicator())
-                    : _error != null
-                        ? Center(
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(horizontal: 24),
-                              child: Text(
-                                'Ошибка загрузки сообщений:\n$_error',
-                                textAlign: TextAlign.center,
-                                style: theme.textTheme.bodyMedium,
-                              ),
-                            ),
-                          )
-                        : _messages.isEmpty
-                            ? Center(
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 24),
+      body: Column(
+        children: [
+          _buildBridgeBanner(),
+          Expanded(
+            child: StreamBuilder<List<DirectMessage>>(
+              stream: _messagesStream,
+              builder: (context, snapshot) {
+                final messages = snapshot.data ?? const <DirectMessage>[];
+
+                if (messages.isEmpty) {
+                  return const Center(
+                    child: Text('Сообщений пока нет'),
+                  );
+                }
+
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  _scrollToBottom();
+                });
+
+                return ListView.separated(
+                  controller: _scrollController,
+                  padding: const EdgeInsets.all(12),
+                  itemCount: messages.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 10),
+                  itemBuilder: (context, index) {
+                    final message = messages[index];
+                    final isMine = message.isMine;
+                    final bubbleColor = _bubbleColor(theme, message);
+
+                    return Align(
+                      alignment: isMine
+                          ? Alignment.centerRight
+                          : Alignment.centerLeft,
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 320),
+                        child: Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: bubbleColor,
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              if (!isMine)
+                                Padding(
+                                  padding: const EdgeInsets.only(bottom: 4),
                                   child: Text(
-                                    'Диалог пока пуст. Напиши первое сообщение или позвони.',
-                                    textAlign: TextAlign.center,
-                                    style: theme.textTheme.bodyMedium,
+                                    widget.friend.displayName,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white70,
+                                      fontSize: 12,
+                                    ),
                                   ),
                                 ),
-                              )
-                            : ListView.separated(
-                                reverse: true,
-                                padding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
-                                itemCount: _messages.length,
-                                separatorBuilder: (_, __) =>
-                                    const SizedBox(height: 10),
-                                itemBuilder: (context, index) {
-                                  final item =
-                                      _messages[_messages.length - 1 - index];
-                                  final bubbleColor = item.isMine
-                                      ? theme.colorScheme.primary
-                                          .withValues(alpha: 0.96)
-                                      : const Color(0xFF1A2333);
-
-                                  return Align(
-                                    alignment: item.isMine
-                                        ? Alignment.centerRight
-                                        : Alignment.centerLeft,
-                                    child: ConstrainedBox(
-                                      constraints:
-                                          const BoxConstraints(maxWidth: 320),
-                                      child: Container(
-                                        padding: const EdgeInsets.all(14),
-                                        decoration: BoxDecoration(
-                                          color: bubbleColor,
-                                          borderRadius:
-                                              BorderRadius.circular(18),
-                                        ),
-                                        child: Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              item.authorDisplayName,
-                                              style: theme.textTheme.titleMedium
-                                                  ?.copyWith(
-                                                color: Colors.white,
-                                                fontSize: 13,
-                                              ),
-                                            ),
-                                            const SizedBox(height: 6),
-                                            Text(
-                                              item.text,
-                                              style: theme.textTheme.bodyLarge
-                                                  ?.copyWith(
-                                                color: Colors.white,
-                                              ),
-                                            ),
-                                            const SizedBox(height: 8),
-                                            Text(
-                                              _formatTime(item.createdAt),
-                                              style: theme.textTheme.bodyMedium
-                                                  ?.copyWith(
-                                                color: Colors.white
-                                                    .withValues(alpha: 0.72),
-                                                fontSize: 12,
-                                              ),
-                                            ),
-                                          ],
-                                        ),
+                              Text(
+                                message.text,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    _formatTime(message.createdAt),
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                  if (isMine) ...[
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      _statusLabel(message.status),
+                                      style: const TextStyle(
+                                        color: Colors.white70,
+                                        fontSize: 11,
                                       ),
                                     ),
-                                  );
-                                },
+                                  ],
+                                ],
                               ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(18, 8, 18, 18),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _messageController,
-                        minLines: 1,
-                        maxLines: 4,
-                        textInputAction: TextInputAction.send,
-                        onSubmitted: (_) => _sendMessage(),
-                        decoration: InputDecoration(
-                          hintText: 'Сообщение для ${widget.friend.displayName}',
+                            ],
+                          ),
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    FilledButton.icon(
-                      onPressed: _sending ? null : _sendMessage,
-                      icon: const Icon(Icons.send_rounded),
-                      label: const Text('Отправить'),
-                    ),
-                  ],
-                ),
-              ),
-            ],
+                    );
+                  },
+                );
+              },
+            ),
           ),
-        ),
+          SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _textController,
+                      minLines: 1,
+                      maxLines: 5,
+                      textInputAction: TextInputAction.newline,
+                      enabled: _bridgeReady && !_isSending,
+                      decoration: InputDecoration(
+                        hintText: _bridgeReady
+                            ? 'Сообщение'
+                            : 'E2EE bridge недоступен',
+                        border: const OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton(
+                    onPressed:
+                        (!_bridgeReady || _isSending) ? null : _sendMessage,
+                    child: _isSending
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.send_rounded),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
 }
+'@ | Set-Content -Path "E:\VSCODE\decentra_call_messenger\apps\client\lib\screens\chat_screen.dart" -Encoding UTF8

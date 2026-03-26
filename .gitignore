@@ -1,39 +1,144 @@
-# Rust
-target/
-**/target/
-Cargo.lock
+# =========================================================
+# Root: decentra_call_messenger
+# Flutter client + Rust signaling server
+# =========================================================
 
-# Runtime data
-data/
-media/
-*.log
-*.sqlite
-*.db
+# -------------------------
+# OS / editor junk
+# -------------------------
+.DS_Store
+Thumbs.db
 
-# Env / secrets
-.env
-.env.*
-*.pem
-*.key
-
-# Flutter / Dart
-.dart_tool/
-.packages
-build/
-.flutter-plugins
-.flutter-plugins-dependencies
-
-# Android
-**/android/.gradle/
-**/android/app/build/
-
-# iOS
-**/ios/Pods/
-**/ios/.symlinks/
-
-# VS Code / IDE
 .vscode/
 .idea/
+*.iml
+*.ipr
+*.iws
+*.swp
 
-# Local helper dumps
+# -------------------------
+# Logs / runtime / local dumps
+# -------------------------
+*.log
 project_dump.txt
+full_project_dump.txt
+
+# local helper dumps/scripts if you do not want them in repo
+# project_dump_all.ps1
+
+# -------------------------
+# Env / secrets / keys
+# -------------------------
+.env
+.env.*
+!.env.example
+!.env.sample
+
+*.pem
+*.key
+*.crt
+*.p12
+*.mobileprovision
+*.cer
+*.der
+
+# Android signing
+*.jks
+*.keystore
+**/key.properties
+
+# -------------------------
+# Generic runtime data
+# -------------------------
+data/
+media/
+*.sqlite
+*.sqlite3
+*.db
+
+# =========================================================
+# Rust
+# =========================================================
+
+target/
+**/target/
+
+# Cargo.lock for APPLICATIONS should usually be committed,
+# and your project already contains it in both Rust app dirs,
+# so DO NOT ignore Cargo.lock here.
+
+# Optional rust backup/temp
+**/*.rs.bk
+
+# =========================================================
+# Flutter / Dart
+# =========================================================
+
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub/
+.pub-cache/
+coverage/
+build/
+**/doc/api/
+
+# Obfuscation / symbolication
+app.*.symbols
+app.*.map.json
+
+# Flutter generated transient files
+**/ios/Flutter/.last_build_id
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Flutter/Generated.xcconfig
+
+# Keep .metadata committed for Flutter project upgrades
+# so DO NOT ignore .metadata
+
+# =========================================================
+# Android
+# =========================================================
+
+**/android/.gradle/
+**/android/captures/
+**/android/local.properties
+**/android/.kotlin/
+**/android/app/build/
+**/android/build/
+
+# Build outputs
+**/android/app/debug/
+**/android/app/profile/
+**/android/app/release/
+
+# Native/CMake junk
+**/android/.cxx/
+
+# NOTE:
+# Do NOT ignore gradle-wrapper.jar, gradlew, gradlew.bat
+# They should stay in repo.
+
+# =========================================================
+# iOS / Xcode
+# =========================================================
+
+**/ios/Pods/
+**/ios/.symlinks/
+**/ios/DerivedData/
+**/ios/Runner.xcworkspace/xcuserdata/
+**/ios/Runner.xcodeproj/xcuserdata/
+
+# =========================================================
+# Python junk (на случай локальных утилит/скриптов)
+# =========================================================
+
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/

@@ -7,9 +7,12 @@ import '../models/app_models.dart';
 
 class SettingsRepository {
   static const _profileKey = 'mayak_profile';
+  static const _displayNameKey = 'mayak_display_name';
+  static const _serverUrlKey = 'mayak_server_url';
   static const _recentRoomsKey = 'recent_rooms';
+  static const _mailboxCursorKeyPrefix = 'mayak_mailbox_cursor';
+  static const _deviceKeyPackageStateKeyPrefix = 'mayak_device_key_package';
 
-  /// Продовый сервер.
   static const String fixedServerUrl = 'ws://155.212.247.22:8080/ws';
 
   static const Set<String> _legacyServerUrls = {
@@ -25,14 +28,22 @@ class SettingsRepository {
       return existing;
     }
 
+    final displayName = await getDisplayName();
+    final serverUrl = await getServerUrl();
+    final parts = displayName.trim().split(RegExp(r'\s+'));
+    final firstName = parts.isNotEmpty ? parts.first : '';
+    final lastName = parts.length > 1 ? parts.skip(1).join(' ') : '';
+
     final profile = UserProfile(
       publicId: _generateShortId('M'),
+      friendCode: '',
       deviceId: _generateShortId('D'),
-      firstName: '',
-      lastName: '',
+      sessionToken: '',
+      firstName: firstName,
+      lastName: lastName,
       phone: '',
       about: 'На связи в Маяке',
-      serverUrl: fixedServerUrl,
+      serverUrl: _normalizeServerUrl(serverUrl),
       createdAt: DateTime.now(),
       registered: false,
     );
@@ -68,173 +79,213 @@ class SettingsRepository {
 
   Future<void> saveProfile(UserProfile profile) async {
     final prefs = await SharedPreferences.getInstance();
-    final normalized = _normalizeProfile(profile);
-    await prefs.setString(_profileKey, jsonEncode(normalized.toJson()));
-  }
+    await prefs.setString(_profileKey, jsonEncode(profile.toJson()));
 
-  Future<void> clearProfile() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_profileKey);
+    await saveBaseSettings(
+      displayName: profile.displayName,
+      serverUrl: profile.serverUrl,
+    );
   }
 
   Future<void> clearSession() async {
-    final profile = await getProfile();
+    final existing = await ensureProfile();
+    await clearMailboxCursor(existing);
+    await clearDeviceKeyPackageState(existing);
 
-    if (profile == null) {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(_recentRoomsKey);
-      return;
-    }
-
-    final cleared = profile.copyWith(
+    final cleared = existing.copyWith(
+      publicId: '',
+      friendCode: '',
+      sessionToken: '',
       firstName: '',
       lastName: '',
       phone: '',
-      about: 'На связи в Маяке',
-      serverUrl: fixedServerUrl,
       registered: false,
     );
-
     await saveProfile(cleared);
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_recentRoomsKey);
-  }
-
-  Future<UserProfile> completeRegistration({
-    required String firstName,
-    required String lastName,
-    required String phone,
-  }) async {
-    final profile = await ensureProfile();
-
-    final updated = profile.copyWith(
-      firstName: firstName.trim(),
-      lastName: lastName.trim(),
-      phone: _normalizePhone(phone),
-      registered: true,
-      serverUrl: fixedServerUrl,
-      about: profile.about.trim().isEmpty ? 'На связи в Маяке' : profile.about,
-    );
-
-    await saveProfile(updated);
-    return updated;
   }
 
   Future<String> getDisplayName() async {
-    final profile = await ensureProfile();
-    return profile.displayName;
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_displayNameKey)?.trim() ?? '';
   }
 
   Future<String> getServerUrl() async {
-    final profile = await ensureProfile();
-    return profile.serverUrl;
-  }
-
-  Future<List<String>> getRecentRooms() async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_recentRoomsKey);
-    if (raw == null || raw.isEmpty) {
-      return [];
-    }
-
-    final decoded = jsonDecode(raw);
-    if (decoded is! List) {
-      return [];
-    }
-
-    return decoded.map((item) => item.toString()).toList();
+    final value = prefs.getString(_serverUrlKey)?.trim() ?? '';
+    return _normalizeServerUrl(value);
   }
 
   Future<void> saveBaseSettings({
     required String displayName,
     required String serverUrl,
   }) async {
-    final profile = await ensureProfile();
-    final parts = displayName
-        .trim()
-        .split(RegExp(r'\s+'))
-        .where((item) => item.trim().isNotEmpty)
-        .toList();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_displayNameKey, displayName.trim());
+    await prefs.setString(_serverUrlKey, _normalizeServerUrl(serverUrl));
+  }
 
-    final firstName = parts.isNotEmpty ? parts.first : profile.firstName;
-    final lastName =
-        parts.length > 1 ? parts.sublist(1).join(' ') : profile.lastName;
+  Future<List<String>> getRecentRooms() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getStringList(_recentRoomsKey) ?? const [];
+  }
 
-    await saveProfile(
-      profile.copyWith(
-        firstName: firstName,
-        lastName: lastName,
-        serverUrl: fixedServerUrl,
-      ),
-    );
+  Future<void> saveRecentRooms(List<String> roomIds) async {
+    final prefs = await SharedPreferences.getInstance();
+    final unique = <String>[];
+
+    for (final roomId in roomIds) {
+      final normalized = roomId.trim().toUpperCase();
+      if (normalized.isEmpty || unique.contains(normalized)) {
+        continue;
+      }
+      unique.add(normalized);
+      if (unique.length >= 20) {
+        break;
+      }
+    }
+
+    await prefs.setStringList(_recentRoomsKey, unique);
   }
 
   Future<void> saveRecentRoom(String roomId) async {
-    final prefs = await SharedPreferences.getInstance();
     final current = await getRecentRooms();
-
-    final updated = <String>[
-      roomId,
-      ...current.where((String item) => item != roomId),
-    ].take(8).toList();
-
-    await prefs.setString(_recentRoomsKey, jsonEncode(updated));
+    final normalized = roomId.trim().toUpperCase();
+    final merged = <String>[
+      normalized,
+      ...current.where((item) => item.trim().toUpperCase() != normalized),
+    ];
+    await saveRecentRooms(merged);
   }
 
-  static String buildDirectChatId(String myPublicId, String friendPublicId) {
-    final ids = [
-      myPublicId.trim().toUpperCase(),
-      friendPublicId.trim().toUpperCase(),
-    ]..sort();
-    return ids.join('__');
+  Future<int?> getMailboxCursor(UserProfile profile) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = _mailboxCursorStorageKey(
+      publicId: profile.publicId,
+      deviceId: profile.deviceId,
+    );
+    return prefs.getInt(key);
   }
 
-  static String buildDirectRoomId(String myPublicId, String friendPublicId) {
-    final chatId = buildDirectChatId(myPublicId, friendPublicId);
-    return 'dm_$chatId';
+  Future<void> saveMailboxCursor(UserProfile profile, int serverSeq) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = _mailboxCursorStorageKey(
+      publicId: profile.publicId,
+      deviceId: profile.deviceId,
+    );
+    await prefs.setInt(key, serverSeq);
+  }
+
+  Future<void> clearMailboxCursor(UserProfile profile) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = _mailboxCursorStorageKey(
+      publicId: profile.publicId,
+      deviceId: profile.deviceId,
+    );
+    await prefs.remove(key);
+  }
+
+  Future<int?> getDeviceKeyPackageVersion(UserProfile profile) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = _deviceKeyPackageStorageKey(
+      publicId: profile.publicId,
+      deviceId: profile.deviceId,
+    );
+    return prefs.getInt(key);
+  }
+
+  Future<bool> isDeviceKeyPackagePublished(
+    UserProfile profile, {
+    int expectedVersion = 1,
+  }) async {
+    final version = await getDeviceKeyPackageVersion(profile);
+    return version != null && version >= expectedVersion;
+  }
+
+  Future<void> markDeviceKeyPackagePublished(
+    UserProfile profile, {
+    int version = 1,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = _deviceKeyPackageStorageKey(
+      publicId: profile.publicId,
+      deviceId: profile.deviceId,
+    );
+    await prefs.setInt(key, version);
+  }
+
+  Future<void> clearDeviceKeyPackageState(UserProfile profile) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = _deviceKeyPackageStorageKey(
+      publicId: profile.publicId,
+      deviceId: profile.deviceId,
+    );
+    await prefs.remove(key);
+  }
+
+  static String buildDirectChatId(String left, String right) {
+    final items = [left.trim().toUpperCase(), right.trim().toUpperCase()]..sort();
+    return 'dm_${items.join('_')}';
   }
 
   UserProfile _normalizeProfile(UserProfile profile) {
-    final rawServerUrl = profile.serverUrl.trim();
-
-    final mustUseFixedServer = _legacyServerUrls.contains(rawServerUrl) ||
-        rawServerUrl.contains('10.0.2.2') ||
-        rawServerUrl.contains('127.0.0.1') ||
-        rawServerUrl.contains('localhost');
-
     return profile.copyWith(
-      phone: _normalizePhone(profile.phone),
-      about: profile.about.trim().isEmpty ? 'На связи в Маяке' : profile.about.trim(),
-      serverUrl: mustUseFixedServer ? fixedServerUrl : rawServerUrl,
+      publicId: profile.publicId.trim().toUpperCase(),
+      friendCode: profile.friendCode.trim().toUpperCase(),
+      deviceId: profile.deviceId.trim().toUpperCase(),
+      sessionToken: profile.sessionToken.trim(),
+      firstName: profile.firstName.trim(),
+      lastName: profile.lastName.trim(),
+      phone: profile.phone.trim(),
+      about: profile.about.trim(),
+      serverUrl: _normalizeServerUrl(profile.serverUrl),
     );
   }
 
-  bool _sameProfile(UserProfile a, UserProfile b) {
-    return a.publicId == b.publicId &&
-        a.deviceId == b.deviceId &&
-        a.firstName == b.firstName &&
-        a.lastName == b.lastName &&
-        a.phone == b.phone &&
-        a.about == b.about &&
-        a.serverUrl == b.serverUrl &&
-        a.createdAt.millisecondsSinceEpoch == b.createdAt.millisecondsSinceEpoch &&
-        a.registered == b.registered;
+  bool _sameProfile(UserProfile left, UserProfile right) {
+    return left.publicId == right.publicId &&
+        left.friendCode == right.friendCode &&
+        left.deviceId == right.deviceId &&
+        left.sessionToken == right.sessionToken &&
+        left.firstName == right.firstName &&
+        left.lastName == right.lastName &&
+        left.phone == right.phone &&
+        left.about == right.about &&
+        left.serverUrl == right.serverUrl &&
+        left.createdAt.millisecondsSinceEpoch ==
+            right.createdAt.millisecondsSinceEpoch &&
+        left.registered == right.registered;
   }
 
-  String _normalizePhone(String value) {
-    return value.replaceAll(RegExp(r'[^0-9]'), '');
+  String _mailboxCursorStorageKey({
+    required String publicId,
+    required String deviceId,
+  }) {
+    return '$_mailboxCursorKeyPrefix:${publicId.trim().toUpperCase()}:${deviceId.trim().toUpperCase()}';
   }
 
-  String _generateShortId(String prefix) {
+  String _deviceKeyPackageStorageKey({
+    required String publicId,
+    required String deviceId,
+  }) {
+    return '$_deviceKeyPackageStateKeyPrefix:${publicId.trim().toUpperCase()}:${deviceId.trim().toUpperCase()}';
+  }
+
+  static String _normalizeServerUrl(String raw) {
+    final value = raw.trim();
+    if (value.isEmpty || _legacyServerUrls.contains(value)) {
+      return fixedServerUrl;
+    }
+    return value;
+  }
+
+  static String _generateShortId(String prefix) {
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     final random = Random.secure();
+    final buffer = StringBuffer(prefix.toUpperCase());
 
-    final chars = List.generate(
-      8,
-      (_) => alphabet[random.nextInt(alphabet.length)],
-    ).join();
-
-    return '$prefix-$chars';
+    for (var i = 0; i < 8; i++) {
+      buffer.write(alphabet[random.nextInt(alphabet.length)]);
+    }
+    return buffer.toString();
   }
 }

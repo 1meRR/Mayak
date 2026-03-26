@@ -35,16 +35,17 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
   }
 
   Future<void> _lookup() async {
-    final publicId = _idController.text.trim().toUpperCase();
+    final query = _idController.text.trim().toUpperCase();
 
-    if (publicId.isEmpty) {
+    if (query.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Введи ID пользователя')),
+        const SnackBar(content: Text('Введи ID пользователя или friend code')),
       );
       return;
     }
 
-    if (publicId == widget.profile.publicId.toUpperCase()) {
+    if (query == widget.profile.publicId.toUpperCase() ||
+        query == widget.profile.friendCode.toUpperCase()) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Нельзя добавить самого себя')),
       );
@@ -57,7 +58,7 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
     });
 
     try {
-      final user = await widget.api.lookupUserByPublicId(publicId);
+      final user = await widget.api.lookupUser(query);
 
       if (!mounted) return;
       setState(() {
@@ -83,6 +84,13 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
       return;
     }
 
+    if (!widget.profile.hasActiveSession) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Сначала войди в аккаунт на этом устройстве')),
+      );
+      return;
+    }
+
     setState(() {
       _sending = true;
     });
@@ -90,6 +98,8 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
     try {
       await widget.api.createFriendRequest(
         fromPublicId: widget.profile.publicId,
+        fromDeviceId: widget.profile.deviceId,
+        sessionToken: widget.profile.sessionToken,
         toPublicId: foundUser.publicId,
       );
 
@@ -132,33 +142,32 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
       ),
       child: SafeArea(
         child: ListView(
-          padding: const EdgeInsets.fromLTRB(18, 18, 18, 24),
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 24),
           children: [
             const SectionHeader(
               title: 'Добавить друга',
-              subtitle: 'Поиск пользователя по короткому ID',
+              subtitle: 'Ищи по public ID или friend code',
             ),
-            const SizedBox(height: 18),
+            const SizedBox(height: 16),
             GlassPanel(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Твой ID', style: theme.textTheme.titleLarge),
-                  const SizedBox(height: 10),
-                  SelectableText(
-                    widget.profile.publicId,
-                    style: theme.textTheme.titleMedium,
+                  Text(
+                    'Твой friend code: ${widget.profile.friendCode.isEmpty ? 'будет после входа' : widget.profile.friendCode}',
+                    style: theme.textTheme.bodyMedium,
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 14),
                   TextField(
                     controller: _idController,
                     textCapitalization: TextCapitalization.characters,
                     decoration: const InputDecoration(
-                      labelText: 'ID пользователя',
-                      hintText: 'Например, M-7Q2K9',
+                      labelText: 'Public ID или friend code',
+                      hintText: 'Например: M8Q3K4P2 или FC7Z91AB',
                     ),
+                    onSubmitted: (_) => _lookup(),
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 14),
                   FilledButton.icon(
                     onPressed: _searching ? null : _lookup,
                     icon: _searching
@@ -168,28 +177,30 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
                         : const Icon(Icons.search_rounded),
-                    label: const Text('Найти'),
+                    label: const Text('Найти пользователя'),
                   ),
                 ],
               ),
             ),
-            if (_foundUser != null) ...[
-              const SizedBox(height: 18),
+            const SizedBox(height: 18),
+            if (_foundUser != null)
               GlassPanel(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Пользователь найден', style: theme.textTheme.titleLarge),
-                    const SizedBox(height: 12),
                     Text(
                       _foundUser!.displayName,
-                      style: theme.textTheme.headlineMedium?.copyWith(fontSize: 26),
+                      style: theme.textTheme.titleLarge,
                     ),
                     const SizedBox(height: 8),
-                    Text(_foundUser!.publicId, style: theme.textTheme.bodyMedium),
+                    Text('ID: ${_foundUser!.publicId}'),
+                    if (_foundUser!.friendCode.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text('Friend code: ${_foundUser!.friendCode}'),
+                    ],
                     if (_foundUser!.about.trim().isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      Text(_foundUser!.about, style: theme.textTheme.bodyMedium),
+                      const SizedBox(height: 8),
+                      Text(_foundUser!.about),
                     ],
                     const SizedBox(height: 16),
                     FilledButton.icon(
@@ -206,7 +217,6 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
                   ],
                 ),
               ),
-            ],
           ],
         ),
       ),

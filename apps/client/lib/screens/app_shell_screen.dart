@@ -1,13 +1,17 @@
-import 'dart:async';
+﻿import 'dart:async';
 
 import 'package:flutter/material.dart';
 
-import '../controllers/call_controller.dart';
 import '../models/app_models.dart';
 import '../services/api_service.dart';
+import '../services/device_socket_service.dart';
+import '../services/e2ee/crypto_bridge.dart';
+import '../services/e2ee/e2ee_message_service.dart';
+import '../services/e2ee/mailbox_service.dart';
+import '../services/e2ee/native_crypto_bridge.dart';
+import '../services/local_message_store.dart';
 import '../services/settings_repository.dart';
 import 'add_friend_screen.dart';
-import 'call_screen.dart';
 import 'chat_screen.dart';
 import 'friends_screen.dart';
 import 'incoming_call_screen.dart';
@@ -23,6 +27,8 @@ class AppShellScreen extends StatefulWidget {
 
 class _AppShellScreenState extends State<AppShellScreen> {
   final SettingsRepository _settings = SettingsRepository();
+  final LocalMessageStore _messageStore = LocalMessageStore();
+  final DeviceSocketService _deviceSocket = DeviceSocketService();
 
   bool _loading = true;
   bool _syncing = false;
@@ -31,29 +37,39 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
   UserProfile? _profile;
   FriendsBundle? _bundle;
-  List<CallInviteView> _incomingCalls = const [];
+  ApiService? _api;
+  E2eeMessageService? _e2ee;
 
   Timer? _pollTimer;
-  String? _activeIncomingInviteId;
+  Timer? _incomingCallTimer;
+  StreamSubscription<DeviceSignalMessage>? _deviceMessageSub;
+
+  bool _presentingIncomingCall = false;
+  final Set<String> _handledIncomingInviteIds = <String>{};
 
   @override
   void initState() {
     super.initState();
     _reload();
     _pollTimer = Timer.periodic(
+      const Duration(seconds: 8),
+      (_) => _backgroundSync(force: false),
+    );
+    _incomingCallTimer = Timer.periodic(
       const Duration(seconds: 5),
-      (_) => _backgroundSync(),
+      (_) => _checkIncomingCalls(),
     );
   }
 
   @override
   void dispose() {
     _pollTimer?.cancel();
+    _incomingCallTimer?.cancel();
+    _deviceMessageSub?.cancel();
+    _deviceSocket.dispose();
+    _messageStore.dispose();
     super.dispose();
   }
-
-  ApiService _apiFor(UserProfile profile) => ApiService(profile.serverUrl);
-  ApiService _apiForServer(String serverUrl) => ApiService(serverUrl);
 
   Future<void> _reload() async {
     setState(() {
@@ -62,86 +78,245 @@ class _AppShellScreenState extends State<AppShellScreen> {
     });
 
     try {
-      var profile = await _settings.ensureProfile();
+      final profile = await _settings.ensureProfile();
+      final api = ApiService(profile.serverUrl);
+      final mailbox = MailboxService(profile.serverUrl);
+      final e2ee = E2eeMessageService(
+        mailboxService: mailbox,
+        cryptoBridge: NativeCryptoBridge(),
+      );
 
-      if (_isAuthenticated(profile)) {
-        final api = _apiFor(profile);
-        profile = await api.registerUser(profile);
-        await _settings.saveProfile(profile);
-        await api.heartbeat(
-          publicId: profile.publicId,
-          deviceId: profile.deviceId,
-        );
-        final bundle = await api.fetchFriends(profile.publicId);
-        final incomingCalls = await api.fetchIncomingCalls(profile.publicId);
-
-        if (!mounted) return;
-
-        setState(() {
-          _profile = profile;
-          _bundle = bundle;
-          _incomingCalls = incomingCalls;
-          _loading = false;
-        });
-
-        await _maybeShowIncomingCall();
-      } else {
-        if (!mounted) return;
-        setState(() {
-          _profile = profile;
-          _bundle = FriendsBundle.empty(profile.publicId);
-          _incomingCalls = const [];
-          _loading = false;
-        });
+      FriendsBundle? bundle;
+      if (profile.registered && profile.publicId.trim().isNotEmpty) {
+        bundle = await api.fetchFriends(profile.publicId);
       }
-    } catch (error, stackTrace) {
-      debugPrint('AppShell reload error: $error');
-      debugPrintStack(stackTrace: stackTrace);
 
       if (!mounted) return;
       setState(() {
+        _profile = profile;
+        _api = api;
+        _e2ee = e2ee;
+        _bundle = bundle;
         _loading = false;
-        _errorMessage = error.toString();
+      });
+
+      await _ensureMailboxBootstrap();
+      await _ensureRealtime();
+      await _backgroundMailboxSync();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _errorMessage = e.toString();
       });
     }
   }
 
-  bool _isAuthenticated(UserProfile profile) {
-    return profile.registered &&
-        profile.publicId.trim().isNotEmpty &&
-        profile.firstName.trim().isNotEmpty;
-  }
-
-  Future<void> _backgroundSync() async {
+  Future<void> _ensureMailboxBootstrap() async {
     final profile = _profile;
-    if (!mounted || profile == null) return;
-    if (!_isAuthenticated(profile)) return;
-    if (_syncing) return;
+    final e2ee = _e2ee;
+    if (profile == null || e2ee == null) return;
+    if (!profile.hasActiveSession) return;
 
-    _syncing = true;
+    final published = await _settings.isDeviceKeyPackagePublished(
+      profile,
+      expectedVersion: 1,
+    );
+    if (published) return;
 
     try {
-      final api = _apiFor(profile);
-      await api.heartbeat(
-        publicId: profile.publicId,
-        deviceId: profile.deviceId,
-      );
-      final bundle = await api.fetchFriends(profile.publicId);
-      final incomingCalls = await api.fetchIncomingCalls(profile.publicId);
+      await e2ee.ensurePublishedDeviceKeys(profile);
+      await _settings.markDeviceKeyPackagePublished(profile, version: 1);
+    } on CryptoBridgeUnavailableException catch (e) {
+      debugPrint('Crypto bridge unavailable during bootstrap: $e');
+    } catch (e) {
+      debugPrint('Mailbox bootstrap failed: $e');
+    }
+  }
+
+  Future<void> _ensureRealtime() async {
+    final profile = _profile;
+    if (profile == null || !profile.hasActiveSession) return;
+
+    await _deviceMessageSub?.cancel();
+
+    try {
+      await _deviceSocket.connect(profile);
+      _deviceMessageSub = _deviceSocket.messages.listen(_handleDeviceSignalMessage);
+    } catch (e) {
+      debugPrint('Device socket connect failed: $e');
+    }
+  }
+
+  Future<void> _backgroundSync({required bool force}) async {
+    final profile = _profile;
+    final api = _api;
+    if (profile == null || api == null) return;
+    if (!profile.registered) return;
+    if (_syncing && !force) return;
+
+    _syncing = true;
+    try {
+      final nextBundle = await api.fetchFriends(profile.publicId);
 
       if (!mounted) return;
-
       setState(() {
-        _bundle = bundle;
-        _incomingCalls = incomingCalls;
+        _bundle = nextBundle;
       });
 
-      await _maybeShowIncomingCall();
-    } catch (error, stackTrace) {
-      debugPrint('Background sync error: $error');
-      debugPrintStack(stackTrace: stackTrace);
+      await _backgroundMailboxSync();
+    } catch (e) {
+      debugPrint('Background sync failed: $e');
     } finally {
       _syncing = false;
+    }
+  }
+
+  Future<void> _backgroundMailboxSync() async {
+    final profile = _profile;
+    final e2ee = _e2ee;
+    final bundle = _bundle;
+    if (profile == null || e2ee == null) return;
+    if (!profile.hasActiveSession) return;
+
+    try {
+      final lastServerSeq = await _settings.getMailboxCursor(profile);
+      final decrypted = await e2ee.fetchAndDecryptPending(
+        profile: profile,
+        afterServerSeq: lastServerSeq,
+        limit: 100,
+        ackRead: true,
+      );
+
+      int? maxSeq = lastServerSeq;
+
+      for (final item in decrypted) {
+        final senderPublicId = item.senderPublicId.trim().toUpperCase();
+
+        if (senderPublicId == profile.publicId.trim().toUpperCase()) {
+          if (maxSeq == null || item.serverSeq > maxSeq) {
+            maxSeq = item.serverSeq;
+          }
+          continue;
+        }
+
+        final friend = bundle?.friends.cast<FriendUser?>().firstWhere(
+              (candidate) =>
+                  candidate?.publicId.trim().toUpperCase() == senderPublicId,
+              orElse: () => null,
+            );
+
+        final message = DirectMessage(
+          id: item.envelopeId.isEmpty
+              ? 'remote_${item.createdAt}'
+              : item.envelopeId,
+          chatId: item.conversationId,
+          authorPublicId: senderPublicId,
+          authorDisplayName: friend?.displayName ?? senderPublicId,
+          text: item.plaintext,
+          createdAt: DateTime.fromMillisecondsSinceEpoch(item.createdAt),
+          isMine: false,
+          status: 'delivered',
+        );
+
+        await _messageStore.upsertMessage(
+          peerPublicId: senderPublicId,
+          peerDeviceId: item.senderDeviceId,
+          envelopeId: item.envelopeId.isEmpty ? null : item.envelopeId,
+          deliveredAt: DateTime.fromMillisecondsSinceEpoch(item.createdAt),
+          acknowledgedAt: DateTime.now(),
+          message: message,
+        );
+
+        if (maxSeq == null || item.serverSeq > maxSeq) {
+          maxSeq = item.serverSeq;
+        }
+      }
+
+      if (maxSeq != null) {
+        await _settings.saveMailboxCursor(profile, maxSeq);
+      }
+    } on CryptoBridgeUnavailableException catch (e) {
+      debugPrint('Crypto bridge unavailable during mailbox sync: $e');
+    } catch (e) {
+      debugPrint('Mailbox sync failed: $e');
+    }
+  }
+
+  void _handleDeviceSignalMessage(DeviceSignalMessage message) {
+    if (message.type == 'pending_envelope') {
+      unawaited(_backgroundMailboxSync());
+      return;
+    }
+  }
+
+  Future<void> _checkIncomingCalls() async {
+    if (_presentingIncomingCall) return;
+
+    final profile = _profile;
+    final api = _api;
+    final bundle = _bundle;
+    if (profile == null || api == null || bundle == null) return;
+    if (!profile.hasActiveSession) return;
+
+    try {
+      final incoming = await api.fetchIncomingCalls(profile.publicId);
+      if (incoming.isEmpty) return;
+
+      final invite = incoming.firstWhere(
+        (item) => !_handledIncomingInviteIds.contains(item.id),
+        orElse: () => CallInviteView(
+          inviteId: '',
+          callerPublicId: '',
+          callerDisplayName: '',
+          calleePublicId: '',
+          calleeDisplayName: '',
+          roomId: '',
+          status: 'pending',
+          createdAt: DateTime.now(),
+          respondedAt: null,
+        ),
+      );
+
+      if (invite.id.isEmpty) return;
+
+      final friend = bundle.friends.cast<FriendUser?>().firstWhere(
+            (item) => item?.publicId == invite.callerPublicId,
+            orElse: () => null,
+          ) ??
+          FriendUser(
+            publicId: invite.callerPublicId,
+            friendCode: '',
+            displayName: invite.callerDisplayName,
+            about: '',
+            createdAt: DateTime.now(),
+            isOnline: true,
+            lastSeenAt: DateTime.now(),
+          );
+
+      _presentingIncomingCall = true;
+      _handledIncomingInviteIds.add(invite.id);
+
+      if (!mounted) {
+        _presentingIncomingCall = false;
+        return;
+      }
+
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => IncomingCallScreen(
+            profile: profile,
+            friend: friend,
+            invite: invite,
+            api: api,
+            socket: _deviceSocket,
+          ),
+        ),
+      );
+
+      _presentingIncomingCall = false;
+    } catch (e) {
+      debugPrint('Incoming call check failed: $e');
     }
   }
 
@@ -152,39 +327,25 @@ class _AppShellScreenState extends State<AppShellScreen> {
     required String password,
     required String serverUrl,
   }) async {
-    final localProfile = await _settings.ensureProfile();
-    final api = _apiForServer(serverUrl);
+    final base = await _settings.ensureProfile();
+    final serverProfile = base.copyWith(serverUrl: serverUrl.trim());
+    final api = ApiService(serverProfile.serverUrl);
 
     final result = await api.registerWithPhone(
-      deviceId: localProfile.deviceId,
+      deviceId: serverProfile.deviceId,
       firstName: firstName,
       lastName: lastName,
       phone: phone,
       password: password,
-      about: localProfile.about,
+      about: 'На связи в Маяке',
     );
 
-    final savedProfile = result.profile.copyWith(
-      deviceId: localProfile.deviceId,
-      serverUrl: serverUrl,
-      createdAt: localProfile.createdAt,
-      about: localProfile.about,
-      registered: true,
-    );
-
-    await _settings.saveProfile(savedProfile);
+    await _settings.saveProfile(result.profile);
+    await _settings.clearMailboxCursor(result.profile);
+    await _settings.clearDeviceKeyPackageState(result.profile);
     await _reload();
 
-    if (!mounted) return AuthRegisterResult(profile: savedProfile, recoveryCodes: result.recoveryCodes);
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Аккаунт создан, контакты теперь привязаны к аккаунту')),
-    );
-
-    return AuthRegisterResult(
-      profile: savedProfile,
-      recoveryCodes: result.recoveryCodes,
-    );
+    return result;
   }
 
   Future<void> _login({
@@ -192,30 +353,20 @@ class _AppShellScreenState extends State<AppShellScreen> {
     required String password,
     required String serverUrl,
   }) async {
-    final localProfile = await _settings.ensureProfile();
-    final api = _apiForServer(serverUrl);
+    final base = await _settings.ensureProfile();
+    final nextProfile = base.copyWith(serverUrl: serverUrl.trim());
+    final api = ApiService(nextProfile.serverUrl);
 
-    final profile = await api.loginWithPhone(
-      deviceId: localProfile.deviceId,
+    final loggedIn = await api.loginWithPhone(
+      deviceId: nextProfile.deviceId,
       phone: phone,
       password: password,
     );
 
-    await _settings.saveProfile(
-      profile.copyWith(
-        deviceId: localProfile.deviceId,
-        serverUrl: serverUrl,
-        createdAt: localProfile.createdAt,
-        registered: true,
-      ),
-    );
-
+    await _settings.saveProfile(loggedIn);
+    await _settings.clearMailboxCursor(loggedIn);
+    await _settings.clearDeviceKeyPackageState(loggedIn);
     await _reload();
-
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Вход выполнен, профиль восстановлен')),
-    );
   }
 
   Future<void> _resetPassword({
@@ -224,7 +375,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
     required String newPassword,
     required String serverUrl,
   }) async {
-    final api = _apiForServer(serverUrl);
+    final api = ApiService(serverUrl.trim());
     await api.resetPasswordWithCode(
       phone: phone,
       recoveryCode: recoveryCode,
@@ -234,201 +385,103 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
   Future<void> _logout() async {
     await _settings.clearSession();
+    await _deviceMessageSub?.cancel();
+    _deviceMessageSub = null;
+    await _deviceSocket.dispose();
     await _reload();
-
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Локальная сессия удалена')),
-    );
   }
 
-  Future<void> _saveProfile(UserProfile updated) async {
-    await _settings.saveProfile(updated);
+  Future<void> _acceptRequest(FriendRequestView request) async {
+    final profile = _profile;
+    final api = _api;
+    if (profile == null || api == null) return;
 
-    final synced = await _apiFor(updated).registerUser(updated);
-    await _settings.saveProfile(synced.copyWith(serverUrl: updated.serverUrl));
-    await _reload();
-
-    if (!mounted) return;
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Профиль сохранён и синхронизирован')),
+    await api.respondFriendRequest(
+      requestId: request.id,
+      actorPublicId: profile.publicId,
+      actorDeviceId: profile.deviceId,
+      sessionToken: profile.sessionToken,
+      action: 'accept',
     );
+
+    await _backgroundSync(force: true);
+  }
+
+  Future<void> _rejectRequest(FriendRequestView request) async {
+    final profile = _profile;
+    final api = _api;
+    if (profile == null || api == null) return;
+
+    await api.respondFriendRequest(
+      requestId: request.id,
+      actorPublicId: profile.publicId,
+      actorDeviceId: profile.deviceId,
+      sessionToken: profile.sessionToken,
+      action: 'reject',
+    );
+
+    await _backgroundSync(force: true);
+  }
+
+  Future<void> _openAddFriend() async {
+    final profile = _profile;
+    final api = _api;
+    if (profile == null || api == null) return;
+
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => AddFriendScreen(
+          profile: profile,
+          api: api,
+          onFriendRequestSent: () => _backgroundSync(force: true),
+        ),
+      ),
+    );
+
+    await _backgroundSync(force: true);
   }
 
   Future<void> _openChat(FriendUser friend) async {
     final profile = _profile;
-    if (profile == null) return;
+    final e2ee = _e2ee;
+    if (profile == null || e2ee == null) return;
 
     await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => ChatScreen(
           profile: profile,
           friend: friend,
+          store: _messageStore,
+          e2ee: e2ee,
+          onSyncRequested: _backgroundMailboxSync,
         ),
       ),
     );
 
-    await _reload();
+    await _backgroundSync(force: true);
   }
 
-  Future<void> _onFriendRequestSent() async {
-    await _reload();
-
-    if (!mounted) return;
-    setState(() {
-      _currentIndex = 0;
-    });
-  }
-
-  Future<void> _acceptRequest(FriendRequestView request) async {
-    final profile = _profile;
-    if (profile == null) return;
-
-    await _apiFor(profile).respondFriendRequest(
-      requestId: request.id,
-      actorPublicId: profile.publicId,
-      action: 'accept',
-    );
-
-    await _reload();
-
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Заявка от ${request.fromDisplayName} принята')),
-    );
-  }
-
-  Future<void> _rejectRequest(FriendRequestView request) async {
-    final profile = _profile;
-    if (profile == null) return;
-
-    await _apiFor(profile).respondFriendRequest(
-      requestId: request.id,
-      actorPublicId: profile.publicId,
-      action: 'reject',
-    );
-
-    await _reload();
-
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Заявка от ${request.fromDisplayName} отклонена')),
-    );
-  }
-
-  Future<void> _maybeShowIncomingCall() async {
-    final profile = _profile;
-    if (!mounted || profile == null) return;
-    if (_activeIncomingInviteId != null) return;
-
-    final pending = _incomingCalls.where((item) => item.status == 'pending').toList();
-    if (pending.isEmpty) return;
-
-    final invite = pending.first;
-    _activeIncomingInviteId = invite.id;
-
-    final action = await Navigator.of(context).push<String>(
-      MaterialPageRoute(
-        fullscreenDialog: true,
-        builder: (_) => IncomingCallScreen(invite: invite),
-      ),
-    );
-
-    if (!mounted) return;
-
-    try {
-      if (action == 'accept') {
-        await _apiFor(profile).respondCallInvite(
-          inviteId: invite.id,
-          actorPublicId: profile.publicId,
-          action: 'accept',
-        );
-
-        await _joinAcceptedCall(profile, invite);
-      } else {
-        await _apiFor(profile).respondCallInvite(
-          inviteId: invite.id,
-          actorPublicId: profile.publicId,
-          action: 'reject',
-        );
-      }
-    } catch (error) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Ошибка обработки звонка: $error')),
-      );
-    } finally {
-      _activeIncomingInviteId = null;
-      await _backgroundSync();
-    }
-  }
-
-  Future<void> _joinAcceptedCall(UserProfile profile, CallInviteView invite) async {
-    final controller = CallController(
-      roomId: invite.roomId,
-      displayName: profile.displayName,
-      serverUrl: profile.serverUrl,
-      isCaller: false,
-    );
-
-    try {
-      await controller.join();
-
-      if (!mounted) {
-        await controller.shutdown(notifyServer: false);
-        controller.dispose();
-        return;
-      }
-
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => CallScreen(controller: controller),
-        ),
-      );
-    } catch (error) {
-      await controller.shutdown(notifyServer: false);
-      controller.dispose();
-
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Не удалось подключиться к звонку: $error')),
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
+  Widget _buildBody() {
     if (_loading) {
-      return const Scaffold(
-        body: SafeArea(
-          child: Center(child: CircularProgressIndicator()),
-        ),
-      );
+      return const Center(child: CircularProgressIndicator());
     }
 
     if (_errorMessage != null) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('Маяк')),
-        body: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(18),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Ошибка загрузки',
-                  style: TextStyle(fontSize: 24, fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 16),
-                SelectableText(_errorMessage!),
-                const SizedBox(height: 20),
-                FilledButton(
-                  onPressed: _reload,
-                  child: const Text('Повторить'),
-                ),
-              ],
-            ),
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.error_outline_rounded, size: 44),
+              const SizedBox(height: 12),
+              Text(_errorMessage!, textAlign: TextAlign.center),
+              const SizedBox(height: 16),
+              FilledButton(
+                onPressed: _reload,
+                child: const Text('Повторить'),
+              ),
+            ],
           ),
         ),
       );
@@ -436,14 +489,10 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
     final profile = _profile;
     if (profile == null) {
-      return const Scaffold(
-        body: SafeArea(
-          child: Center(child: Text('Профиль не инициализирован')),
-        ),
-      );
+      return const Center(child: Text('Профиль недоступен'));
     }
 
-    if (!_isAuthenticated(profile)) {
+    if (!profile.registered) {
       return OnboardingScreen(
         profile: profile,
         onRegister: _register,
@@ -454,56 +503,75 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
     final bundle = _bundle ?? FriendsBundle.empty(profile.publicId);
 
-    final pages = [
-      FriendsScreen(
-        profile: profile,
-        friends: bundle.friends,
-        incomingRequests: bundle.incomingRequests,
-        outgoingRequests: bundle.outgoingRequests,
-        onOpenChat: _openChat,
-        onAcceptRequest: _acceptRequest,
-        onRejectRequest: _rejectRequest,
-        onRefresh: _reload,
-      ),
-      AddFriendScreen(
-        profile: profile,
-        api: _apiFor(profile),
-        onFriendRequestSent: _onFriendRequestSent,
-      ),
-      ProfileScreen(
-        profile: profile,
-        onSave: _saveProfile,
-        onLogout: _logout,
-      ),
-    ];
+    switch (_currentIndex) {
+      case 0:
+        return FriendsScreen(
+          profile: profile,
+          friends: bundle.friends,
+          incomingRequests: bundle.incomingRequests,
+          outgoingRequests: bundle.outgoingRequests,
+          onOpenChat: _openChat,
+          onAcceptRequest: _acceptRequest,
+          onRejectRequest: _rejectRequest,
+          onRefresh: () => _backgroundSync(force: true),
+        );
+      case 1:
+        return ProfileScreen(
+          profile: profile,
+          onSave: (updated) async {
+            await _settings.saveProfile(updated);
+            await _reload();
+          },
+          onLogout: _logout,
+        );
+      default:
+        return FriendsScreen(
+          profile: profile,
+          friends: bundle.friends,
+          incomingRequests: bundle.incomingRequests,
+          outgoingRequests: bundle.outgoingRequests,
+          onOpenChat: _openChat,
+          onAcceptRequest: _acceptRequest,
+          onRejectRequest: _rejectRequest,
+          onRefresh: () => _backgroundSync(force: true),
+        );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final profile = _profile;
 
     return Scaffold(
-      body: pages[_currentIndex],
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _currentIndex,
-        onDestinationSelected: (index) {
-          setState(() {
-            _currentIndex = index;
-          });
-        },
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.people_alt_outlined),
-            selectedIcon: Icon(Icons.people_alt_rounded),
-            label: 'Друзья',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.person_add_alt_1_outlined),
-            selectedIcon: Icon(Icons.person_add_alt_1_rounded),
-            label: 'Добавить',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.account_circle_outlined),
-            selectedIcon: Icon(Icons.account_circle_rounded),
-            label: 'Профиль',
-          ),
-        ],
-      ),
+      body: _buildBody(),
+      bottomNavigationBar: profile == null || !profile.registered
+          ? null
+          : NavigationBar(
+              selectedIndex: _currentIndex,
+              onDestinationSelected: (index) {
+                if (!mounted) return;
+                setState(() {
+                  _currentIndex = index;
+                });
+              },
+              destinations: const [
+                NavigationDestination(
+                  icon: Icon(Icons.people_alt_rounded),
+                  label: 'Друзья',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.person_rounded),
+                  label: 'Профиль',
+                ),
+              ],
+            ),
+      floatingActionButton:
+          profile != null && profile.registered && _currentIndex == 0
+              ? FloatingActionButton(
+                  onPressed: _openAddFriend,
+                  child: const Icon(Icons.person_add_alt_1.person_add_alt_1.person_add_alt_1_rounded),
+                )
+              : null,
     );
   }
 }

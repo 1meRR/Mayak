@@ -1,4 +1,4 @@
-﻿use crate::domain::models::{
+use crate::domain::models::{
     AckEnvelopeResponse, CreateFileObjectRequest, DeviceDirectoryView, DeviceKeyPackageView,
     FileKeyEnvelopeView, FileLookupResponse, FileObjectView, LoginResponse, RecipientEnvelopeInput,
     RegisterRequest, StoredEnvelopeView, UpsertDeviceKeyPackageRequest, UserProfileView,

@@ -1,436 +1,439 @@
+﻿import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:intl/intl.dart';
 
-import '../controllers/call_controller.dart';
+import '../models/app_models.dart';
+import '../services/e2ee/crypto_models.dart';
+import '../services/e2ee/e2ee_message_service.dart';
+import '../services/local_message_store.dart';
 
-class CallScreen extends StatefulWidget {
-  const CallScreen({
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({
     super.key,
-    required this.controller,
+    required this.profile,
+    required this.friend,
+    required this.store,
+    required this.e2ee,
+    this.onSyncRequested,
   });
 
-  final CallController controller;
+  final UserProfile profile;
+  final FriendUser friend;
+  final LocalMessageStore store;
+  final E2eeMessageService e2ee;
+  final Future<void> Function()? onSyncRequested;
 
   @override
-  State<CallScreen> createState() => _CallScreenState();
+  State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _CallScreenState extends State<CallScreen> {
-  final TextEditingController _chatController = TextEditingController();
+class _ChatScreenState extends State<ChatScreen> {
+  final TextEditingController _textController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
 
-  bool _showChat = false;
-  bool _swapFeeds = false;
-  bool _ended = false;
+  Stream<List<DirectMessage>>? _messagesStream;
+
+  bool _isSending = false;
+  bool _isSyncing = false;
+  bool _bridgeReady = false;
+  String? _bridgeProblem;
+
+  String get _chatId => _buildChatId(
+        widget.profile.publicId,
+        widget.friend.publicId,
+      );
 
   @override
   void initState() {
     super.initState();
-    widget.controller.addListener(_onControllerChanged);
+    _messagesStream = widget.store.watchMessages(chatId: _chatId);
+    _initAsync();
   }
 
-  @override
-  void dispose() {
-    widget.controller.removeListener(_onControllerChanged);
-    _chatController.dispose();
-    _closeCallIfNeeded();
-    super.dispose();
+  static String _buildChatId(String id1, String id2) {
+    final list = [
+      id1.trim().toUpperCase(),
+      id2.trim().toUpperCase(),
+    ]..sort();
+    return 'dm_${list.join('_')}';
   }
 
-  void _onControllerChanged() {
-    if (mounted) {
-      setState(() {});
+  Future<void> _initAsync() async {
+    await _checkBridge();
+    await _syncNow();
+  }
+
+  Future<void> _checkBridge() async {
+    try {
+      final status = await widget.e2ee.getBridgeStatus();
+      if (!mounted) return;
+
+      setState(() {
+        _bridgeReady = status.available;
+        _bridgeProblem = status.available
+            ? null
+            : (status.reason ?? 'native crypto bridge is unavailable');
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _bridgeReady = false;
+        _bridgeProblem = e.toString();
+      });
     }
   }
 
-  Future<void> _closeCallIfNeeded() async {
-    if (_ended) return;
-    _ended = true;
-    await widget.controller.shutdown();
-    widget.controller.dispose();
-  }
+  Future<void> _syncNow() async {
+    if (_isSyncing) return;
 
-  Future<bool> _onWillPop() async {
-    await _closeCallIfNeeded();
-    return true;
-  }
-
-  void _toggleSwap() {
     setState(() {
-      _swapFeeds = !_swapFeeds;
+      _isSyncing = true;
     });
+
+    try {
+      if (widget.onSyncRequested != null) {
+        await widget.onSyncRequested!.call();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ошибка синхронизации: $e')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSyncing = false;
+        });
+      }
+    }
   }
 
-  void _toggleChat() {
-    setState(() {
-      _showChat = !_showChat;
-    });
-  }
+  Future<void> _sendMessage() async {
+    final text = _textController.text.trim();
+    if (text.isEmpty || _isSending) return;
 
-  Future<void> _sendChat() async {
-    final text = _chatController.text.trim();
-    if (text.isEmpty) return;
-    _chatController.clear();
-    await widget.controller.sendChatMessage(text);
-  }
-
-  Widget _buildVideoView({
-    required RTCVideoRenderer renderer,
-    required bool mirror,
-    required bool fullScreen,
-  }) {
-    final hasStream = renderer.srcObject != null;
-
-    if (!hasStream) {
-      return Container(
-        color: const Color(0xFF111827),
-        child: Center(
-          child: Text(
-            'Ожидаем видео...',
-            style: Theme.of(context).textTheme.titleMedium,
+    if (!_bridgeReady) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            _bridgeProblem ??
+                'E2EE bridge недоступен. Нельзя отправлять plaintext через placeholder transport.',
           ),
+        ),
+      );
+      return;
+    }
+
+    _textController.clear();
+    setState(() {
+      _isSending = true;
+    });
+
+    final optimistic = DirectMessage(
+      id: 'local_${DateTime.now().millisecondsSinceEpoch}',
+      chatId: _chatId,
+      authorPublicId: widget.profile.publicId,
+      authorDisplayName: widget.profile.displayName,
+      text: text,
+      createdAt: DateTime.now(),
+      isMine: true,
+      status: 'queued',
+    );
+
+    try {
+      await widget.store.upsertMessage(
+        peerPublicId: widget.friend.publicId,
+        message: optimistic,
+      );
+
+      final stored = await widget.e2ee.sendEncryptedText(
+        senderProfile: widget.profile,
+        friend: widget.friend,
+        plaintext: text,
+        clientMessageId: optimistic.id,
+      );
+
+      if (stored.isEmpty) {
+        throw Exception('Сервер не сохранил ни одного envelope');
+      }
+
+      final first = stored.first;
+
+      await widget.store.updateMessageStatus(
+        messageId: optimistic.id,
+        status: 'sent',
+        peerDeviceId: first.recipientDeviceId,
+        envelopeId: first.envelopeId,
+        deliveredAt: DateTime.now(),
+      );
+
+      await _syncNow();
+
+      if (!mounted) return;
+      _scrollToBottom();
+    } catch (e) {
+      await widget.store.updateMessageStatus(
+        messageId: optimistic.id,
+        status: 'failed',
+        lastError: e.toString(),
+        nextRetryAt: DateTime.now().add(const Duration(seconds: 30)),
+      );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ошибка E2EE-отправки: $e')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSending = false;
+        });
+      }
+    }
+  }
+
+  void _scrollToBottom() {
+    if (!_scrollController.hasClients) return;
+    _scrollController.animateTo(
+      _scrollController.position.maxScrollExtent,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+    );
+  }
+
+  String _formatTime(DateTime value) => DateFormat('HH:mm').format(value);
+
+  String _statusLabel(String status) {
+    switch (status) {
+      case 'queued':
+        return 'queued';
+      case 'sent':
+        return 'sent';
+      case 'delivered':
+        return 'delivered';
+      case 'acknowledged':
+        return 'acknowledged';
+      case 'failed':
+        return 'failed';
+      default:
+        return status;
+    }
+  }
+
+  Color _bubbleColor(ThemeData theme, DirectMessage message) {
+    if (message.isMine) {
+      switch (message.status) {
+        case 'failed':
+          return Colors.red.shade400;
+        case 'queued':
+          return Colors.orange.shade400;
+        default:
+          return theme.colorScheme.primary;
+      }
+    }
+
+    return const Color(0xFF1A2333);
+  }
+
+  Widget _buildBridgeBanner() {
+    if (_bridgeReady) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        color: Colors.green.shade700,
+        child: const Text(
+          'E2EE bridge active',
+          style: TextStyle(color: Colors.white, fontSize: 12),
+          textAlign: TextAlign.center,
         ),
       );
     }
 
-    return RTCVideoView(
-      renderer,
-      mirror: mirror,
-      objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-      filterQuality: FilterQuality.medium,
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final controller = widget.controller;
-
-    final RTCVideoRenderer mainRenderer =
-        _swapFeeds ? controller.localRenderer : controller.remoteRenderer;
-    final bool mainMirror = _swapFeeds;
-
-    final RTCVideoRenderer pipRenderer =
-        _swapFeeds ? controller.remoteRenderer : controller.localRenderer;
-    final bool pipMirror = !_swapFeeds;
-
-    return WillPopScope(
-      onWillPop: _onWillPop,
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: Stack(
-          children: [
-            Positioned.fill(
-              child: GestureDetector(
-                onTap: _toggleSwap,
-                child: _buildVideoView(
-                  renderer: mainRenderer,
-                  mirror: mainMirror,
-                  fullScreen: true,
-                ),
-              ),
-            ),
-            Positioned(
-              top: 54,
-              left: 16,
-              right: 16,
-              child: SafeArea(
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Expanded(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 10,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.34),
-                          borderRadius: BorderRadius.circular(18),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              controller.remoteDisplayName ?? 'Звонок',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              controller.connectionText,
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 13,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Container(
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.34),
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                      child: IconButton(
-                        onPressed: _toggleChat,
-                        icon: Icon(
-                          _showChat
-                              ? Icons.chat_bubble_rounded
-                              : Icons.chat_bubble_outline_rounded,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            Positioned(
-              right: 16,
-              top: 120,
-              child: GestureDetector(
-                onTap: _toggleSwap,
-                child: Container(
-                  width: 120,
-                  height: 180,
-                  decoration: BoxDecoration(
-                    color: Colors.black,
-                    borderRadius: BorderRadius.circular(18),
-                    border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.18),
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        blurRadius: 20,
-                        color: Colors.black.withValues(alpha: 0.24),
-                      ),
-                    ],
-                  ),
-                  clipBehavior: Clip.antiAlias,
-                  child: _buildVideoView(
-                    renderer: pipRenderer,
-                    mirror: pipMirror,
-                    fullScreen: false,
-                  ),
-                ),
-              ),
-            ),
-            Positioned(
-              left: 16,
-              right: 16,
-              bottom: 28,
-              child: SafeArea(
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    _RoundActionButton(
-                      icon: controller.isMicEnabled
-                          ? Icons.mic_rounded
-                          : Icons.mic_off_rounded,
-                      onTap: controller.toggleMicrophone,
-                    ),
-                    const SizedBox(width: 14),
-                    _RoundActionButton(
-                      icon: controller.isCameraEnabled
-                          ? Icons.videocam_rounded
-                          : Icons.videocam_off_rounded,
-                      onTap: controller.toggleCamera,
-                    ),
-                    const SizedBox(width: 14),
-                    _RoundActionButton(
-                      icon: Icons.cameraswitch_rounded,
-                      onTap: controller.switchCamera,
-                    ),
-                    const SizedBox(width: 14),
-                    _RoundActionButton(
-                      icon: Icons.call_end_rounded,
-                      backgroundColor: Colors.redAccent,
-                      onTap: () async {
-                        await _closeCallIfNeeded();
-                        if (mounted) {
-                          Navigator.of(context).pop();
-                        }
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            AnimatedPositioned(
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeOut,
-              left: 0,
-              right: 0,
-              bottom: _showChat ? 0 : -360,
-              child: SafeArea(
-                top: false,
-                child: Container(
-                  height: 340,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF0D1220),
-                    borderRadius: const BorderRadius.vertical(
-                      top: Radius.circular(28),
-                    ),
-                    border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.06),
-                    ),
-                  ),
-                  child: Column(
-                    children: [
-                      const SizedBox(height: 10),
-                      Container(
-                        width: 42,
-                        height: 5,
-                        decoration: BoxDecoration(
-                          color: Colors.white24,
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 16),
-                        child: Row(
-                          children: [
-                            const Expanded(
-                              child: Text(
-                                'Чат звонка',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 18,
-                                ),
-                              ),
-                            ),
-                            IconButton(
-                              onPressed: _toggleChat,
-                              icon: const Icon(
-                                Icons.keyboard_arrow_down_rounded,
-                                color: Colors.white,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Expanded(
-                        child: ListView.builder(
-                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-                          itemCount: controller.chatItems.length,
-                          itemBuilder: (context, index) {
-                            final item = controller.chatItems[index];
-                            return Align(
-                              alignment: item.isLocal
-                                  ? Alignment.centerRight
-                                  : Alignment.centerLeft,
-                              child: Container(
-                                margin: const EdgeInsets.only(bottom: 10),
-                                padding: const EdgeInsets.all(12),
-                                constraints:
-                                    const BoxConstraints(maxWidth: 280),
-                                decoration: BoxDecoration(
-                                  color: item.isLocal
-                                      ? const Color(0xFF4466FF)
-                                      : const Color(0xFF1A2333),
-                                  borderRadius: BorderRadius.circular(16),
-                                ),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      item.displayName,
-                                      style: const TextStyle(
-                                        color: Colors.white70,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      item.text,
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 15,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child: TextField(
-                                controller: _chatController,
-                                style: const TextStyle(color: Colors.white),
-                                decoration: InputDecoration(
-                                  hintText: 'Сообщение во время звонка',
-                                  hintStyle:
-                                      const TextStyle(color: Colors.white54),
-                                  filled: true,
-                                  fillColor: Colors.white.withValues(alpha: 0.06),
-                                  border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(18),
-                                    borderSide: BorderSide.none,
-                                  ),
-                                ),
-                                onSubmitted: (_) => _sendChat(),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            FilledButton(
-                              onPressed: _sendChat,
-                              child: const Icon(Icons.send_rounded),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      color: Colors.red.shade700,
+      child: Text(
+        _bridgeProblem ??
+            'E2EE bridge unavailable. Chat is fail-closed for sending.',
+        style: const TextStyle(color: Colors.white, fontSize: 12),
+        textAlign: TextAlign.center,
       ),
     );
   }
-}
 
-class _RoundActionButton extends StatelessWidget {
-  const _RoundActionButton({
-    required this.icon,
-    required this.onTap,
-    this.backgroundColor,
-  });
-
-  final IconData icon;
-  final Future<void> Function() onTap;
-  final Color? backgroundColor;
+  @override
+  void dispose() {
+    _textController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      color: backgroundColor ?? Colors.black.withValues(alpha: 0.34),
-      shape: const CircleBorder(),
-      child: InkWell(
-        customBorder: const CircleBorder(),
-        onTap: () => onTap(),
-        child: Padding(
-          padding: const EdgeInsets.all(18),
-          child: Icon(
-            icon,
-            color: Colors.white,
-            size: 24,
-          ),
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(widget.friend.displayName),
+            const Text(
+              'E2EE mailbox chat',
+              style: TextStyle(fontSize: 12, color: Colors.lightGreenAccent),
+            ),
+          ],
         ),
+        actions: [
+          IconButton(
+            icon: _isSyncing
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.refresh_rounded),
+            onPressed: _isSyncing ? null : _syncNow,
+            tooltip: 'Синхронизировать',
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          _buildBridgeBanner(),
+          Expanded(
+            child: StreamBuilder<List<DirectMessage>>(
+              stream: _messagesStream,
+              builder: (context, snapshot) {
+                final messages = snapshot.data ?? const <DirectMessage>[];
+
+                if (messages.isEmpty) {
+                  return const Center(
+                    child: Text('Сообщений пока нет'),
+                  );
+                }
+
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  _scrollToBottom();
+                });
+
+                return ListView.separated(
+                  controller: _scrollController,
+                  padding: const EdgeInsets.all(12),
+                  itemCount: messages.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 10),
+                  itemBuilder: (context, index) {
+                    final message = messages[index];
+                    final isMine = message.isMine;
+                    final bubbleColor = _bubbleColor(theme, message);
+
+                    return Align(
+                      alignment: isMine
+                          ? Alignment.centerRight
+                          : Alignment.centerLeft,
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 320),
+                        child: Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: bubbleColor,
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              if (!isMine)
+                                Padding(
+                                  padding: const EdgeInsets.only(bottom: 4),
+                                  child: Text(
+                                    widget.friend.displayName,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white70,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ),
+                              Text(
+                                message.text,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    _formatTime(message.createdAt),
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                  if (isMine) ...[
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      _statusLabel(message.status),
+                                      style: const TextStyle(
+                                        color: Colors.white70,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _textController,
+                      minLines: 1,
+                      maxLines: 5,
+                      textInputAction: TextInputAction.newline,
+                      enabled: _bridgeReady && !_isSending,
+                      decoration: InputDecoration(
+                        hintText: _bridgeReady
+                            ? 'Сообщение'
+                            : 'E2EE bridge недоступен',
+                        border: const OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton(
+                    onPressed:
+                        (!_bridgeReady || _isSending) ? null : _sendMessage,
+                    child: _isSending
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.send_rounded),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

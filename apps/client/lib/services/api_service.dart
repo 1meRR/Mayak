@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../models/app_models.dart';
+import '../models/p2p_models.dart';
 
 class ApiService {
   ApiService(this.serverUrl);
@@ -11,7 +12,8 @@ class ApiService {
 
   Uri _baseUri() {
     final uri = Uri.parse(serverUrl);
-    final scheme = uri.scheme == 'wss' ? 'https' : 'http';
+    final scheme =
+        uri.scheme == 'wss' ? 'https' : uri.scheme == 'ws' ? 'http' : uri.scheme;
 
     return Uri(
       scheme: scheme,
@@ -20,14 +22,29 @@ class ApiService {
     );
   }
 
-  Uri _uri(String path) {
+  Uri _uri(
+    String path, {
+    Map<String, dynamic>? queryParameters,
+  }) {
     final base = _baseUri();
-    return base.replace(path: path);
+    return base.replace(
+      path: path,
+      queryParameters:
+          queryParameters?.map((key, value) => MapEntry(key, value.toString())),
+    );
   }
 
-  Future<Map<String, dynamic>> _decode(http.Response response) async {
+  Future<dynamic> _decodeAny(http.Response response) async {
     final body = response.body.trim();
-    final decoded = body.isEmpty ? <String, dynamic>{} : jsonDecode(body);
+    if (body.isEmpty) {
+      return <String, dynamic>{};
+    }
+
+    return jsonDecode(body);
+  }
+
+  Future<Map<String, dynamic>> _decodeMap(http.Response response) async {
+    final decoded = await _decodeAny(response);
 
     if (decoded is Map<String, dynamic>) {
       return decoded;
@@ -39,16 +56,41 @@ class ApiService {
     throw Exception('Некорректный ответ сервера');
   }
 
+  Future<List<dynamic>> _decodeList(http.Response response) async {
+    final decoded = await _decodeAny(response);
+    if (decoded is List) {
+      return decoded;
+    }
+    throw Exception('Некорректный ответ сервера');
+  }
+
+  Map<String, String> _headers({
+    String? bearerToken,
+    bool json = true,
+    String? deviceId,
+  }) {
+    return {
+      if (json) 'Content-Type': 'application/json',
+      if (bearerToken != null && bearerToken.trim().isNotEmpty)
+        'Authorization': 'Bearer ${bearerToken.trim()}',
+      if (deviceId != null && deviceId.trim().isNotEmpty)
+        'x-device-id': deviceId.trim().toUpperCase(),
+    };
+  }
+
   Future<Map<String, dynamic>> _request(
     String method,
     Uri uri, {
     Map<String, dynamic>? body,
+    String? bearerToken,
+    String? deviceIdHeader,
   }) async {
     late http.Response response;
 
-    const headers = {
-      'Content-Type': 'application/json',
-    };
+    final headers = _headers(
+      bearerToken: bearerToken,
+      deviceId: deviceIdHeader,
+    );
 
     if (method == 'GET') {
       response = await http.get(uri, headers: headers);
@@ -56,49 +98,98 @@ class ApiService {
       response = await http.post(
         uri,
         headers: headers,
-        body: jsonEncode(body ?? <String, dynamic>{}),
+        body: jsonEncode(body ?? const <String, dynamic>{}),
       );
     } else {
-      throw Exception('Неподдерживаемый метод $method');
+      throw Exception('Неподдерживаемый HTTP-метод: $method');
     }
 
-    final decoded = await _decode(response);
+    final decoded = await _decodeMap(response);
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      final error = decoded['error']?.toString() ?? 'Ошибка сервера';
-      throw Exception(error);
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return decoded;
     }
 
-    return decoded;
+    final message = decoded['error']?.toString().trim();
+    if (message != null && message.isNotEmpty) {
+      throw Exception(message);
+    }
+
+    throw Exception('HTTP ${response.statusCode}');
   }
 
-  Future<void> health() async {
-    await _request('GET', _uri('/health'));
+  Future<List<dynamic>> _requestList(
+    String method,
+    Uri uri, {
+    Map<String, dynamic>? body,
+    String? bearerToken,
+    String? deviceIdHeader,
+  }) async {
+    late http.Response response;
+
+    final headers = _headers(
+      bearerToken: bearerToken,
+      deviceId: deviceIdHeader,
+    );
+
+    if (method == 'GET') {
+      response = await http.get(uri, headers: headers);
+    } else if (method == 'POST') {
+      response = await http.post(
+        uri,
+        headers: headers,
+        body: jsonEncode(body ?? const <String, dynamic>{}),
+      );
+    } else {
+      throw Exception('Неподдерживаемый HTTP-метод: $method');
+    }
+
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return _decodeList(response);
+    }
+
+    final decoded = await _decodeMap(response);
+    final message = decoded['error']?.toString().trim();
+    if (message != null && message.isNotEmpty) {
+      throw Exception(message);
+    }
+
+    throw Exception('HTTP ${response.statusCode}');
   }
 
-  UserProfile _profileFromAuthResponse(
+  UserProfile _profileFromV1AuthResponse(
     Map<String, dynamic> decoded, {
     required String serverUrl,
+    required String phone,
   }) {
-    final userMap = decoded['user'];
-    final deviceMap = decoded['device'];
-
-    if (userMap is! Map || deviceMap is! Map) {
+    final profileMap = decoded['profile'];
+    if (profileMap is! Map) {
       throw Exception('Сервер вернул неполный профиль');
     }
 
-    final user = userMap.map((key, value) => MapEntry(key.toString(), value));
-    final device = deviceMap.map((key, value) => MapEntry(key.toString(), value));
+    final profile =
+        profileMap.map((key, value) => MapEntry(key.toString(), value));
+    final displayName = profile['displayName']?.toString().trim() ?? '';
+    final nameParts = displayName
+        .split(RegExp(r'\s+'))
+        .where((item) => item.trim().isNotEmpty)
+        .toList();
+
+    final firstName = nameParts.isNotEmpty ? nameParts.first : '';
+    final lastName =
+        nameParts.length > 1 ? nameParts.skip(1).join(' ') : '';
 
     return UserProfile(
-      publicId: user['publicId']?.toString() ?? '',
-      deviceId: device['deviceId']?.toString() ?? '',
-      firstName: user['firstName']?.toString() ?? '',
-      lastName: user['lastName']?.toString() ?? '',
-      phone: user['phone']?.toString() ?? '',
-      about: user['about']?.toString() ?? '',
+      publicId: profile['publicId']?.toString() ?? '',
+      friendCode: profile['friendCode']?.toString() ?? '',
+      deviceId: decoded['deviceId']?.toString() ?? '',
+      sessionToken: decoded['sessionToken']?.toString() ?? '',
+      firstName: firstName,
+      lastName: lastName,
+      phone: phone.trim(),
+      about: profile['about']?.toString() ?? '',
       serverUrl: serverUrl,
-      createdAt: DateTime.now(),
+      createdAt: _parseDateTime(profile['createdAt']),
       registered: true,
     );
   }
@@ -111,36 +202,27 @@ class ApiService {
     required String password,
     required String about,
   }) async {
-    final decoded = await _request(
+    await _request(
       'POST',
-      _uri('/api/auth/register'),
+      _uri('/v1/auth/register'),
       body: {
-        'deviceId': deviceId,
+        'phoneE164': phone.trim(),
+        'password': password,
         'firstName': firstName.trim(),
         'lastName': lastName.trim(),
-        'phone': phone.trim(),
-        'password': password,
         'about': about.trim(),
-        'platform': 'android',
       },
     );
 
-    final profile = _profileFromAuthResponse(decoded, serverUrl: serverUrl);
-    final rawCodes = decoded['recoveryCodes'];
-    final recoveryCodes = rawCodes is List
-        ? rawCodes
-            .whereType<Map>()
-            .map(
-              (item) => RecoveryCodeView.fromJson(
-                item.map((key, value) => MapEntry(key.toString(), value)),
-              ),
-            )
-            .toList()
-        : <RecoveryCodeView>[];
+    final profile = await loginWithPhone(
+      deviceId: deviceId,
+      phone: phone,
+      password: password,
+    );
 
     return AuthRegisterResult(
       profile: profile,
-      recoveryCodes: recoveryCodes,
+      recoveryCodes: const [],
     );
   }
 
@@ -151,16 +233,20 @@ class ApiService {
   }) async {
     final decoded = await _request(
       'POST',
-      _uri('/api/auth/login'),
+      _uri('/v1/auth/login'),
       body: {
-        'deviceId': deviceId,
-        'phone': phone.trim(),
+        'phoneE164': phone.trim(),
         'password': password,
+        'deviceId': deviceId.trim().toUpperCase(),
         'platform': 'android',
       },
     );
 
-    return _profileFromAuthResponse(decoded, serverUrl: serverUrl);
+    return _profileFromV1AuthResponse(
+      decoded,
+      serverUrl: serverUrl,
+      phone: phone.trim(),
+    );
   }
 
   Future<void> resetPasswordWithCode({
@@ -179,54 +265,108 @@ class ApiService {
     );
   }
 
-  Future<UserProfile> registerUser(UserProfile profile) async {
-    final decoded = await _request(
-      'POST',
-      _uri('/api/register'),
-      body: {
-        'publicId': profile.publicId,
-        'deviceId': profile.deviceId,
-        'firstName': profile.firstName,
-        'lastName': profile.lastName,
-        'phone': profile.phone,
-        'about': profile.about,
-        'platform': 'android',
-      },
-    );
-
-    final userMap = decoded['user'];
-    final deviceMap = decoded['device'];
-
-    if (userMap is! Map || deviceMap is! Map) {
-      throw Exception('Сервер вернул неполный профиль');
-    }
-
-    final user = userMap.map((key, value) => MapEntry(key.toString(), value));
-    final device = deviceMap.map((key, value) => MapEntry(key.toString(), value));
-
-    return profile.copyWith(
-      publicId: user['publicId']?.toString() ?? profile.publicId,
-      deviceId: device['deviceId']?.toString() ?? profile.deviceId,
-      firstName: user['firstName']?.toString() ?? profile.firstName,
-      lastName: user['lastName']?.toString() ?? profile.lastName,
-      phone: user['phone']?.toString() ?? profile.phone,
-      about: user['about']?.toString() ?? profile.about,
-      registered: true,
-    );
-  }
-
   Future<void> heartbeat({
     required String publicId,
     required String deviceId,
+    required String sessionToken,
   }) async {
     await _request(
       'POST',
       _uri('/api/presence/heartbeat'),
       body: {
-        'publicId': publicId,
-        'deviceId': deviceId,
+        'publicId': publicId.trim().toUpperCase(),
+        'deviceId': deviceId.trim().toUpperCase(),
+        'sessionToken': sessionToken.trim(),
       },
     );
+  }
+
+  Future<void> announceP2pDevice({
+    required String publicId,
+    required String deviceId,
+    required String sessionToken,
+    required String platform,
+    required String appVersion,
+    required String signalingWsUrl,
+    required String transportPreference,
+    required List<String> stunServers,
+    required List<String> turnServers,
+    required Map<String, dynamic> capabilities,
+  }) async {
+    await _request(
+      'POST',
+      _uri('/api/p2p/devices/announce'),
+      body: {
+        'publicId': publicId.trim().toUpperCase(),
+        'deviceId': deviceId.trim().toUpperCase(),
+        'sessionToken': sessionToken.trim(),
+        'platform': platform,
+        'appVersion': appVersion,
+        'signalingWsUrl': signalingWsUrl,
+        'transportPreference': transportPreference,
+        'stunServers': stunServers,
+        'turnServers': turnServers,
+        'capabilities': capabilities,
+      },
+    );
+  }
+
+  Future<void> markP2pDeviceOffline({
+    required String publicId,
+    required String deviceId,
+    required String sessionToken,
+  }) async {
+    await _request(
+      'POST',
+      _uri('/api/p2p/devices/offline'),
+      body: {
+        'publicId': publicId.trim().toUpperCase(),
+        'deviceId': deviceId.trim().toUpperCase(),
+        'sessionToken': sessionToken.trim(),
+      },
+    );
+  }
+
+  Future<List<PeerDeviceEndpoint>> fetchPeerDevices(String publicId) async {
+    final rawList = await _requestList(
+      'GET',
+      _uri('/v1/users/${publicId.trim().toUpperCase()}/devices'),
+    );
+
+    return rawList
+        .whereType<Map>()
+        .map((item) {
+          final json =
+              item.map((key, value) => MapEntry(key.toString(), value));
+          return PeerDeviceEndpoint(
+            publicId: json['publicId']?.toString() ?? '',
+            deviceId: json['deviceId']?.toString() ?? '',
+            isOnline: json['isOnline'] as bool? ?? false,
+            lastSeenAt: _parseNullableDateTime(json['lastSeenAt']),
+            platform: json['platform']?.toString() ?? '',
+            appVersion: json['appVersion']?.toString() ?? '',
+            signalingWsUrl: serverUrl,
+            transportPreference: 'mailbox',
+            stunServers: const [],
+            turnServers: const [],
+            capabilities: json['capabilities'] is Map
+                ? (json['capabilities'] as Map)
+                    .map((key, value) => MapEntry(key.toString(), value))
+                : const <String, dynamic>{},
+          );
+        })
+        .toList();
+  }
+
+  Future<FriendUser> lookupUser(String codeOrPublicId) async {
+    final normalized = codeOrPublicId.trim().toUpperCase();
+    if (normalized.isEmpty) {
+      throw Exception('Нужно указать ID или friend code');
+    }
+
+    return normalized.startsWith('U') || normalized.startsWith('M')
+        ? lookupUserByPublicId(normalized)
+        : lookupUserByFriendCode(normalized);
   }
 
   Future<FriendUser> lookupUserByPublicId(String publicId) async {
@@ -243,15 +383,24 @@ class ApiService {
     }
 
     final user = userMap.map((key, value) => MapEntry(key.toString(), value));
+    return FriendUser.fromJson(user);
+  }
 
-    return FriendUser(
-      publicId: user['publicId']?.toString() ?? normalized,
-      displayName: user['displayName']?.toString() ?? 'Пользователь',
-      about: user['about']?.toString() ?? '',
-      createdAt: DateTime.now(),
-      isOnline: false,
-      lastSeenAt: null,
+  Future<FriendUser> lookupUserByFriendCode(String friendCode) async {
+    final normalized = friendCode.trim().toUpperCase();
+
+    final decoded = await _request(
+      'GET',
+      _uri('/api/users/by-friend-code/$normalized'),
     );
+
+    final userMap = decoded['user'];
+    if (userMap is! Map) {
+      throw Exception('Пользователь не найден');
+    }
+
+    final user = userMap.map((key, value) => MapEntry(key.toString(), value));
+    return FriendUser.fromJson(user);
   }
 
   Future<FriendsBundle> fetchFriends(String publicId) async {
@@ -267,6 +416,8 @@ class ApiService {
 
   Future<FriendRequestView> createFriendRequest({
     required String fromPublicId,
+    required String fromDeviceId,
+    required String sessionToken,
     required String toPublicId,
   }) async {
     final decoded = await _request(
@@ -274,6 +425,8 @@ class ApiService {
       _uri('/api/friends/request'),
       body: {
         'fromPublicId': fromPublicId.trim().toUpperCase(),
+        'fromDeviceId': fromDeviceId.trim().toUpperCase(),
+        'sessionToken': sessionToken.trim(),
         'toPublicId': toPublicId.trim().toUpperCase(),
       },
     );
@@ -284,6 +437,8 @@ class ApiService {
   Future<FriendRequestView> respondFriendRequest({
     required String requestId,
     required String actorPublicId,
+    required String actorDeviceId,
+    required String sessionToken,
     required String action,
   }) async {
     final decoded = await _request(
@@ -292,6 +447,8 @@ class ApiService {
       body: {
         'requestId': requestId,
         'actorPublicId': actorPublicId.trim().toUpperCase(),
+        'actorDeviceId': actorDeviceId.trim().toUpperCase(),
+        'sessionToken': sessionToken.trim(),
         'action': action,
       },
     );
@@ -299,72 +456,10 @@ class ApiService {
     return FriendRequestView.fromJson(decoded);
   }
 
-  Future<List<DirectMessage>> fetchMessages({
-    required String chatId,
-    required String myPublicId,
-  }) async {
-    final decoded = await _request(
-      'GET',
-      _uri('/api/chats/$chatId/messages'),
-    );
-
-    final rawItems = decoded['items'];
-    if (rawItems is! List) {
-      return [];
-    }
-
-    final items = rawItems
-        .whereType<Map>()
-        .map(
-          (item) => DirectMessage.fromJson(
-            item.map((key, value) => MapEntry(key.toString(), value)),
-            myPublicId: myPublicId,
-          ),
-        )
-        .toList();
-
-    items.sort((a, b) => a.createdAt.compareTo(b.createdAt));
-    return items;
-  }
-
-  Future<DirectMessage> sendMessage({
-    required String fromPublicId,
-    required String toPublicId,
-    required String text,
-    required String authorDisplayName,
-  }) async {
-    final decoded = await _request(
-      'POST',
-      _uri('/api/messages/send'),
-      body: {
-        'fromPublicId': fromPublicId.trim().toUpperCase(),
-        'toPublicId': toPublicId.trim().toUpperCase(),
-        'text': text.trim(),
-      },
-    );
-
-    final messageMap = decoded['message'];
-    final chatId = decoded['chatId']?.toString() ?? '';
-
-    if (messageMap is! Map) {
-      throw Exception('Сервер не вернул сообщение');
-    }
-
-    final data = messageMap.map((key, value) => MapEntry(key.toString(), value));
-    final message = DirectMessage.fromJson(
-      {
-        ...data,
-        'authorDisplayName': authorDisplayName,
-        'chatId': chatId,
-      },
-      myPublicId: fromPublicId,
-    );
-
-    return message;
-  }
-
   Future<CallInviteView> createCallInvite({
     required String callerPublicId,
+    required String callerDeviceId,
+    required String sessionToken,
     required String calleePublicId,
   }) async {
     final decoded = await _request(
@@ -372,6 +467,8 @@ class ApiService {
       _uri('/api/calls/invite'),
       body: {
         'callerPublicId': callerPublicId.trim().toUpperCase(),
+        'callerDeviceId': callerDeviceId.trim().toUpperCase(),
+        'sessionToken': sessionToken.trim(),
         'calleePublicId': calleePublicId.trim().toUpperCase(),
       },
     );
@@ -396,7 +493,7 @@ class ApiService {
 
     final rawItems = decoded['items'];
     if (rawItems is! List) {
-      return [];
+      return const <CallInviteView>[];
     }
 
     return rawItems
@@ -412,6 +509,8 @@ class ApiService {
   Future<CallInviteView> respondCallInvite({
     required String inviteId,
     required String actorPublicId,
+    required String actorDeviceId,
+    required String sessionToken,
     required String action,
   }) async {
     final decoded = await _request(
@@ -420,10 +519,243 @@ class ApiService {
       body: {
         'inviteId': inviteId,
         'actorPublicId': actorPublicId.trim().toUpperCase(),
-        'action': action,
+        'actorDeviceId': actorDeviceId.trim().toUpperCase(),
+        'sessionToken': sessionToken.trim(),
+        'action': action.trim().toLowerCase(),
       },
     );
 
     return CallInviteView.fromJson(decoded);
   }
+
+  Future<Map<String, dynamic>> ensurePlaceholderMailboxKeyPackage({
+    required UserProfile profile,
+  }) async {
+    final body = {
+      'deviceId': profile.deviceId.trim().toUpperCase(),
+      'identityKeyAlg': 'x25519+ed25519',
+      'identityKeyB64': _placeholderOpaque(
+        '${profile.publicId}:${profile.deviceId}:identity',
+      ),
+      'signedPrekeyB64': _placeholderOpaque(
+        '${profile.publicId}:${profile.deviceId}:signed-prekey',
+      ),
+      'signedPrekeySignatureB64': _placeholderOpaque(
+        '${profile.publicId}:${profile.deviceId}:signed-signature',
+      ),
+      'signedPrekeyKeyId': 1,
+      'oneTimePrekeys': List.generate(
+        20,
+        (index) => _placeholderOpaque(
+          '${profile.publicId}:${profile.deviceId}:otk:${index + 1}',
+        ),
+      ),
+    };
+
+    return _request(
+      'POST',
+      _uri('/v1/devices/key-package'),
+      bearerToken: profile.sessionToken,
+      body: body,
+    );
+  }
+
+  Future<Map<String, dynamic>> claimPrekey({
+    required String publicId,
+    required String deviceId,
+  }) async {
+    return _request(
+      'POST',
+      _uri('/v1/prekeys/claim'),
+      body: {
+        'publicId': publicId.trim().toUpperCase(),
+        'deviceId': deviceId.trim().toUpperCase(),
+      },
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> fetchPendingMailbox({
+    required UserProfile profile,
+    int limit = 100,
+    int? afterServerSeq,
+  }) async {
+    final raw = await _request(
+      'GET',
+      _uri(
+        '/v1/messages/pending',
+        queryParameters: {
+          'deviceId': profile.deviceId.trim().toUpperCase(),
+          'limit': limit,
+          if (afterServerSeq != null) 'afterServerSeq': afterServerSeq,
+        },
+      ),
+      bearerToken: profile.sessionToken,
+    );
+
+    final items = raw['items'];
+    if (items is! List) {
+      return const <Map<String, dynamic>>[];
+    }
+
+    return items
+        .whereType<Map>()
+        .map((item) => item.map((key, value) => MapEntry(key.toString(), value)))
+        .toList();
+  }
+
+  Future<Map<String, dynamic>> ackEnvelope({
+    required UserProfile profile,
+    required String envelopeId,
+    bool markRead = true,
+  }) async {
+    return _request(
+      'POST',
+      _uri('/v1/messages/${envelopeId.trim()}/ack'),
+      bearerToken: profile.sessionToken,
+      body: {
+        'deviceId': profile.deviceId.trim().toUpperCase(),
+        'markRead': markRead,
+      },
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> sendMailboxTextPlaceholder({
+    required UserProfile profile,
+    required FriendUser friend,
+    required String text,
+    required String clientMessageId,
+  }) async {
+    final devices = await fetchPeerDevices(friend.publicId);
+    if (devices.isEmpty) {
+      throw Exception('У пользователя нет активных устройств для mailbox-доставки');
+    }
+
+    final normalizedText = text.trim();
+    if (normalizedText.isEmpty) {
+      throw Exception('Пустое сообщение отправлять нельзя');
+    }
+
+    final recipients = <Map<String, dynamic>>[];
+
+    for (final device in devices) {
+      await claimPrekey(
+        publicId: friend.publicId,
+        deviceId: device.deviceId,
+      );
+
+      recipients.add({
+        'recipientPublicId': friend.publicId.trim().toUpperCase(),
+        'recipientDeviceId': device.deviceId.trim().toUpperCase(),
+        'messageKind': 'text',
+        'protocol': 'mailbox-placeholder-v0',
+        'headerB64': base64Encode(
+          utf8.encode(
+            jsonEncode({
+              'clientMessageId': clientMessageId,
+              'senderPublicId': profile.publicId,
+              'senderDeviceId': profile.deviceId,
+              'note': 'transitional-placeholder-payload-not-real-e2ee',
+            }),
+          ),
+        ),
+        'ciphertextB64': base64Encode(utf8.encode(normalizedText)),
+        'metadata': {
+          'clientMessageId': clientMessageId,
+          'placeholder': true,
+          'encoding': 'base64-utf8',
+        },
+      });
+    }
+
+    final decoded = await _request(
+      'POST',
+      _uri('/v1/messages/send'),
+      bearerToken: profile.sessionToken,
+      body: {
+        'envelopeGroupId': 'grp_${DateTime.now().millisecondsSinceEpoch}',
+        'conversationId': _buildDirectChatId(profile.publicId, friend.publicId),
+        'senderDeviceId': profile.deviceId.trim().toUpperCase(),
+        'recipients': recipients,
+      },
+    );
+
+    final stored = decoded['stored'];
+    if (stored is! List) {
+      return const <Map<String, dynamic>>[];
+    }
+
+    return stored
+        .whereType<Map>()
+        .map((item) => item.map((key, value) => MapEntry(key.toString(), value)))
+        .toList();
+  }
+
+  String? tryDecodeMailboxPlaceholderText(Map<String, dynamic> envelope) {
+    final protocol = envelope['protocol']?.toString() ?? '';
+    if (protocol != 'mailbox-placeholder-v0') {
+      return null;
+    }
+
+    final metadata = envelope['metadata'];
+    final encoding = metadata is Map ? metadata['encoding']?.toString() : null;
+    if (encoding != 'base64-utf8') {
+      return null;
+    }
+
+    final ciphertextB64 = envelope['ciphertextB64']?.toString() ?? '';
+    if (ciphertextB64.trim().isEmpty) {
+      return null;
+    }
+
+    try {
+      return utf8.decode(base64Decode(ciphertextB64));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String _placeholderOpaque(String seed) {
+    return base64Encode(utf8.encode(seed));
+  }
+
+  static String _buildDirectChatId(String id1, String id2) {
+    final list = [id1.trim().toUpperCase(), id2.trim().toUpperCase()];
+    list.sort();
+    return 'dm_${list.join('_')}';
+  }
+}
+
+DateTime _parseDateTime(dynamic value) {
+  if (value == null) {
+    return DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  if (value is int) {
+    return DateTime.fromMillisecondsSinceEpoch(value);
+  }
+
+  if (value is String) {
+    final millis = int.tryParse(value);
+    if (millis != null) {
+      return DateTime.fromMillisecondsSinceEpoch(millis);
+    }
+
+    final parsed = DateTime.tryParse(value);
+    if (parsed != null) {
+      return parsed;
+    }
+  }
+
+  if (value is num) {
+    return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+  }
+
+  return DateTime.fromMillisecondsSinceEpoch(0);
+}
+
+DateTime? _parseNullableDateTime(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+  return _parseDateTime(value);
 }

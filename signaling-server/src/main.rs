@@ -1,4 +1,4 @@
-﻿mod domain;
+mod domain;
 mod storage;
 
 use axum::{

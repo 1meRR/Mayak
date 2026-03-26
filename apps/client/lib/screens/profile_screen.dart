@@ -1,9 +1,7 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../models/app_models.dart';
 import '../widgets/glass_panel.dart';
-import '../widgets/section_header.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({
@@ -13,9 +11,9 @@ class ProfileScreen extends StatefulWidget {
     required this.onLogout,
   });
 
-  final ValueChanged<UserProfile> onSave;
-  final VoidCallback onLogout;
   final UserProfile profile;
+  final Future<void> Function(UserProfile updated) onSave;
+  final Future<void> Function() onLogout;
 
   @override
   State<ProfileScreen> createState() => _ProfileScreenState();
@@ -25,6 +23,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
   late final TextEditingController _firstNameController;
   late final TextEditingController _lastNameController;
   late final TextEditingController _aboutController;
+
+  bool _saving = false;
 
   @override
   void initState() {
@@ -42,32 +42,40 @@ class _ProfileScreenState extends State<ProfileScreen> {
     super.dispose();
   }
 
-  void _save() {
-    final firstName = _firstNameController.text.trim();
-    if (firstName.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Имя обязательно')),
-      );
+  Future<void> _save() async {
+    if (_saving) {
       return;
     }
 
-    final updated = widget.profile.copyWith(
-      firstName: firstName,
-      lastName: _lastNameController.text.trim(),
-      about: _aboutController.text.trim(),
-      registered: true,
-      serverUrl: widget.profile.serverUrl,
-    );
+    setState(() {
+      _saving = true;
+    });
 
-    widget.onSave(updated);
-  }
+    try {
+      final updated = widget.profile.copyWith(
+        firstName: _firstNameController.text.trim(),
+        lastName: _lastNameController.text.trim(),
+        about: _aboutController.text.trim(),
+      );
 
-  Future<void> _copy(String value, String title) async {
-    await Clipboard.setData(ClipboardData(text: value));
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('$title скопирован')),
-    );
+      await widget.onSave(updated);
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Профиль сохранён локально на этом устройстве')),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Не удалось сохранить профиль: $error')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+        });
+      }
+    }
   }
 
   @override
@@ -88,43 +96,25 @@ class _ProfileScreenState extends State<ProfileScreen> {
       ),
       child: SafeArea(
         child: ListView(
-          padding: const EdgeInsets.fromLTRB(18, 18, 18, 24),
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 24),
           children: [
-            const SectionHeader(
-              title: 'Профиль',
-              subtitle: 'Аккаунт и устройство',
-            ),
-            const SizedBox(height: 18),
             GlassPanel(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('ID пользователя', style: theme.textTheme.titleLarge),
-                  const SizedBox(height: 10),
-                  SelectableText(
-                    widget.profile.publicId,
-                    style: theme.textTheme.headlineMedium?.copyWith(fontSize: 24),
-                  ),
+                  Text('Аккаунт', style: theme.textTheme.titleLarge),
                   const SizedBox(height: 12),
-                  OutlinedButton.icon(
-                    onPressed: () => _copy(widget.profile.publicId, 'ID пользователя'),
-                    icon: const Icon(Icons.copy_rounded),
-                    label: const Text('Скопировать ID пользователя'),
-                  ),
-                  const SizedBox(height: 18),
-                  Text('Телефон аккаунта', style: theme.textTheme.titleLarge),
+                  SelectableText(widget.profile.publicId),
                   const SizedBox(height: 10),
-                  SelectableText(
-                    widget.profile.phone,
-                    style: theme.textTheme.titleMedium,
-                  ),
-                  const SizedBox(height: 18),
-                  Text('ID устройства', style: theme.textTheme.titleLarge),
-                  const SizedBox(height: 10),
-                  SelectableText(
-                    widget.profile.deviceId,
-                    style: theme.textTheme.titleMedium,
-                  ),
+                  if (widget.profile.friendCode.isNotEmpty) ...[
+                    Text('Friend code', style: theme.textTheme.titleMedium),
+                    const SizedBox(height: 6),
+                    SelectableText(widget.profile.friendCode),
+                    const SizedBox(height: 10),
+                  ],
+                  Text('ID устройства', style: theme.textTheme.titleMedium),
+                  const SizedBox(height: 6),
+                  SelectableText(widget.profile.deviceId),
                 ],
               ),
             ),
@@ -137,7 +127,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   const SizedBox(height: 16),
                   TextField(
                     controller: _firstNameController,
-                    decoration: const InputDecoration(labelText: 'Имя *'),
+                    decoration: const InputDecoration(labelText: 'Имя'),
                   ),
                   const SizedBox(height: 14),
                   TextField(
@@ -153,8 +143,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   ),
                   const SizedBox(height: 18),
                   FilledButton.icon(
-                    onPressed: _save,
-                    icon: const Icon(Icons.save_rounded),
+                    onPressed: _saving ? null : _save,
+                    icon: _saving
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.save_rounded),
                     label: const Text('Сохранить'),
                   ),
                 ],
@@ -168,7 +164,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   Text('Сессия', style: theme.textTheme.titleLarge),
                   const SizedBox(height: 10),
                   Text(
-                    'Выход удалит локальную сессию только на этом устройстве. Контакты и переписки останутся в аккаунте на сервере.',
+                    'Выход удалит локальную сессию только на этом устройстве. История чатов хранится локально на устройствах участников и не должна находиться на сервере.',
                     style: theme.textTheme.bodyMedium,
                   ),
                   const SizedBox(height: 16),
