@@ -1,6 +1,7 @@
 import '../../models/app_models.dart';
 import 'crypto_bridge.dart';
 import 'crypto_models.dart';
+import 'mailbox_models.dart';
 import 'mailbox_service.dart';
 
 class E2eeMessageService {

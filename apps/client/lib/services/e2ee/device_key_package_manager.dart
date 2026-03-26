@@ -30,6 +30,7 @@ class DeviceKeyPackageManager {
       identityKeyAlg:
           raw['identityKeyAlg']?.toString() ?? 'x25519+ed25519',
       identityKeyB64: raw['identityKeyB64']?.toString() ?? '',
+      identitySigningKeyB64: raw['identitySigningKeyB64']?.toString(),
       signedPrekeyB64: raw['signedPrekeyB64']?.toString() ?? '',
       signedPrekeySignatureB64:
           raw['signedPrekeySignatureB64']?.toString() ?? '',
@@ -64,6 +65,8 @@ class DeviceKeyPackageManager {
       deviceId: profile.deviceId.trim().toUpperCase(),
       identityKeyAlg: 'x25519+ed25519',
       identityKeyB64: _fakeB64('${profile.publicId}:${profile.deviceId}:identity'),
+      identitySigningKeyB64:
+          _fakeB64('${profile.publicId}:${profile.deviceId}:identity-signing'),
       signedPrekeyB64:
           _fakeB64('${profile.publicId}:${profile.deviceId}:signed-prekey'),
       signedPrekeySignatureB64:
