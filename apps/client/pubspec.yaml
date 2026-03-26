@@ -23,6 +23,7 @@ dependencies:
   uuid: ^4.5.1
   provider: ^6.1.2
   intl: ^0.20.2
+  cryptography: ^2.7.0
 
 dev_dependencies:
   flutter_test:

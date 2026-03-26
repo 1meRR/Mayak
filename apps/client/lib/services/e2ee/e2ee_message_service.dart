@@ -1,7 +1,7 @@
-@'
 import '../../models/app_models.dart';
 import 'crypto_bridge.dart';
 import 'crypto_models.dart';
+import 'mailbox_models.dart';
 import 'mailbox_service.dart';
 
 class E2eeMessageService {
@@ -102,7 +102,8 @@ class E2eeMessageService {
       profile: senderProfile,
       conversationId: conversationId,
       senderDeviceId: senderProfile.deviceId,
-      recipients: outgoing.map((item) => item.toRecipientEnvelopePayload()).toList(),
+      recipients:
+          outgoing.map((item) => item.toRecipientEnvelopePayload()).toList(),
     );
   }
 
@@ -149,4 +150,3 @@ class E2eeMessageService {
     return decrypted;
   }
 }
-'@ | Set-Content -Path "E:\VSCODE\decentra_call_messenger\apps\client\lib\services\e2ee\e2ee_message_service.dart" -Encoding UTF8
