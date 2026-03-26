@@ -1,4 +1,3 @@
-﻿@'
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -16,6 +15,8 @@ class ChatScreen extends StatefulWidget {
     required this.store,
     required this.e2ee,
     this.onSyncRequested,
+    this.onSafetyNumberRequested,
+    this.onSendFileRequested,
   });
 
   final UserProfile profile;
@@ -23,6 +24,8 @@ class ChatScreen extends StatefulWidget {
   final LocalMessageStore store;
   final E2eeMessageService e2ee;
   final Future<void> Function()? onSyncRequested;
+  final Future<String> Function()? onSafetyNumberRequested;
+  final Future<void> Function(String label)? onSendFileRequested;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -35,6 +38,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Stream<List<DirectMessage>>? _messagesStream;
 
   bool _isSending = false;
+  bool _isSendingFile = false;
   bool _isSyncing = false;
   bool _bridgeReady = false;
   String? _bridgeProblem;
@@ -105,6 +109,60 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {
           _isSyncing = false;
         });
+      }
+    }
+  }
+
+
+  Future<void> _showSafetyNumber() async {
+    if (widget.onSafetyNumberRequested == null) {
+      return;
+    }
+
+    try {
+      final safety = await widget.onSafetyNumberRequested!.call();
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Safety number'),
+          content: SelectableText(safety),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Не удалось получить safety number: $e')),
+      );
+    }
+  }
+
+  Future<void> _sendDemoFile() async {
+    if (_isSendingFile || widget.onSendFileRequested == null) {
+      return;
+    }
+
+    setState(() => _isSendingFile = true);
+    try {
+      await widget.onSendFileRequested!.call(_textController.text.trim());
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Encrypted file envelope отправлен')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ошибка отправки файла: $e')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isSendingFile = false);
       }
     }
   }
@@ -288,6 +346,11 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.verified_user_rounded),
+            onPressed: _showSafetyNumber,
+            tooltip: 'Safety number',
+          ),
+          IconButton(
             icon: _isSyncing
                 ? const SizedBox(
                     width: 18,
@@ -330,9 +393,8 @@ class _ChatScreenState extends State<ChatScreen> {
                     final bubbleColor = _bubbleColor(theme, message);
 
                     return Align(
-                      alignment: isMine
-                          ? Alignment.centerRight
-                          : Alignment.centerLeft,
+                      alignment:
+                          isMine ? Alignment.centerRight : Alignment.centerLeft,
                       child: ConstrainedBox(
                         constraints: const BoxConstraints(maxWidth: 320),
                         child: Container(
@@ -410,17 +472,26 @@ class _ChatScreenState extends State<ChatScreen> {
                       textInputAction: TextInputAction.newline,
                       enabled: _bridgeReady && !_isSending,
                       decoration: InputDecoration(
-                        hintText: _bridgeReady
-                            ? 'Сообщение'
-                            : 'E2EE bridge недоступен',
+                        hintText:
+                            _bridgeReady ? 'Сообщение' : 'E2EE bridge недоступен',
                         border: const OutlineInputBorder(),
                       ),
                     ),
                   ),
                   const SizedBox(width: 8),
+                  IconButton.filledTonal(
+                    onPressed: _isSendingFile ? null : _sendDemoFile,
+                    icon: _isSendingFile
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.attach_file_rounded),
+                  ),
+                  const SizedBox(width: 8),
                   FilledButton(
-                    onPressed:
-                        (!_bridgeReady || _isSending) ? null : _sendMessage,
+                    onPressed: (!_bridgeReady || _isSending) ? null : _sendMessage,
                     child: _isSending
                         ? const SizedBox(
                             width: 18,
@@ -438,4 +509,3 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 }
-'@ | Set-Content -Path "E:\VSCODE\decentra_call_messenger\apps\client\lib\screens\chat_screen.dart" -Encoding UTF8

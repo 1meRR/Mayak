@@ -1,4 +1,3 @@
-@'
 import '../../models/app_models.dart';
 import 'mailbox_models.dart';
 
@@ -19,6 +18,7 @@ class CryptoDeviceKeyPackage {
     required this.deviceId,
     required this.identityKeyAlg,
     required this.identityKeyB64,
+    required this.identitySigningKeyB64,
     required this.signedPrekeyB64,
     required this.signedPrekeySignatureB64,
     required this.signedPrekeyKeyId,
@@ -28,6 +28,7 @@ class CryptoDeviceKeyPackage {
   final String deviceId;
   final String identityKeyAlg;
   final String identityKeyB64;
+  final String? identitySigningKeyB64;
   final String signedPrekeyB64;
   final String signedPrekeySignatureB64;
   final int signedPrekeyKeyId;
@@ -38,6 +39,7 @@ class CryptoDeviceKeyPackage {
       deviceId: deviceId,
       identityKeyAlg: identityKeyAlg,
       identityKeyB64: identityKeyB64,
+      identitySigningKeyB64: identitySigningKeyB64,
       signedPrekeyB64: signedPrekeyB64,
       signedPrekeySignatureB64: signedPrekeySignatureB64,
       signedPrekeyKeyId: signedPrekeyKeyId,
@@ -51,6 +53,7 @@ class CryptoDeviceKeyPackage {
       deviceId: json['deviceId']?.toString() ?? '',
       identityKeyAlg: json['identityKeyAlg']?.toString() ?? '',
       identityKeyB64: json['identityKeyB64']?.toString() ?? '',
+      identitySigningKeyB64: json['identitySigningKeyB64']?.toString(),
       signedPrekeyB64: json['signedPrekeyB64']?.toString() ?? '',
       signedPrekeySignatureB64:
           json['signedPrekeySignatureB64']?.toString() ?? '',
@@ -66,6 +69,7 @@ class CryptoDeviceKeyPackage {
       'deviceId': deviceId,
       'identityKeyAlg': identityKeyAlg,
       'identityKeyB64': identityKeyB64,
+      'identitySigningKeyB64': identitySigningKeyB64,
       'signedPrekeyB64': signedPrekeyB64,
       'signedPrekeySignatureB64': signedPrekeySignatureB64,
       'signedPrekeyKeyId': signedPrekeyKeyId,
@@ -80,6 +84,7 @@ class CryptoRemotePrekeyBundle {
     required this.deviceId,
     required this.identityKeyAlg,
     required this.identityKeyB64,
+    required this.identitySigningKeyB64,
     required this.signedPrekeyB64,
     required this.signedPrekeySignatureB64,
     required this.signedPrekeyKeyId,
@@ -91,6 +96,7 @@ class CryptoRemotePrekeyBundle {
   final String deviceId;
   final String identityKeyAlg;
   final String identityKeyB64;
+  final String? identitySigningKeyB64;
   final String signedPrekeyB64;
   final String signedPrekeySignatureB64;
   final int signedPrekeyKeyId;
@@ -105,6 +111,7 @@ class CryptoRemotePrekeyBundle {
       deviceId: bundle.deviceId,
       identityKeyAlg: bundle.identityKeyAlg,
       identityKeyB64: bundle.identityKeyB64,
+      identitySigningKeyB64: bundle.identitySigningKeyB64,
       signedPrekeyB64: bundle.signedPrekeyB64,
       signedPrekeySignatureB64: bundle.signedPrekeySignatureB64,
       signedPrekeyKeyId: bundle.signedPrekeyKeyId,
@@ -120,6 +127,7 @@ class CryptoRemotePrekeyBundle {
       'deviceId': deviceId,
       'identityKeyAlg': identityKeyAlg,
       'identityKeyB64': identityKeyB64,
+      'identitySigningKeyB64': identitySigningKeyB64,
       'signedPrekeyB64': signedPrekeyB64,
       'signedPrekeySignatureB64': signedPrekeySignatureB64,
       'signedPrekeyKeyId': signedPrekeyKeyId,
@@ -254,4 +262,3 @@ String buildClientMessageId({
 }) {
   return 'msg_${profile.publicId}_${profile.deviceId}_$unixMs';
 }
-'@ | Set-Content -Path "E:\VSCODE\decentra_call_messenger\apps\client\lib\services\e2ee\crypto_models.dart" -Encoding UTF8
