@@ -162,7 +162,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
     final passphrase = await _askPassphrase('Восстановить encrypted backup');
     if (passphrase == null) return;
-    if (!mounted) return;
 
     final blobCtrl = TextEditingController();
     final blob = await showDialog<String>(

@@ -3,16 +3,20 @@ import 'dart:typed_data';
 
 import '../../models/app_models.dart';
 import 'e2ee_file_service.dart';
+import 'mailbox_service.dart';
 import 'secure_device_storage.dart';
 
 class FileTransferStateService {
   FileTransferStateService({
     required E2eeFileService fileService,
+    required MailboxService mailboxService,
     SecureDeviceStorage? secureStorage,
   })  : _fileService = fileService,
+        _mailboxService = mailboxService,
         _secureStorage = secureStorage ?? SecureDeviceStorage();
 
   final E2eeFileService _fileService;
+  final MailboxService _mailboxService;
   final SecureDeviceStorage _secureStorage;
 
   static const _stateName = 'file_transfer_state_v1';

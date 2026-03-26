@@ -98,7 +98,7 @@ class SecureDeviceStorage {
         continue;
       }
       final value = entry.value;
-      if (value.trim().isEmpty) {
+      if (value == null || value.trim().isEmpty) {
         continue;
       }
       try {
