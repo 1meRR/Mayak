@@ -374,7 +374,7 @@ class ApiService {
 
     final decoded = await _request(
       'GET',
-      _uri('/api/users/by-public-id/$normalized'),
+      _uri('/v1/users/by-public-id/$normalized'),
     );
 
     final userMap = decoded['user'];
@@ -391,7 +391,7 @@ class ApiService {
 
     final decoded = await _request(
       'GET',
-      _uri('/api/users/by-friend-code/$normalized'),
+      _uri('/v1/users/by-friend-code/$normalized'),
     );
 
     final userMap = decoded['user'];
@@ -408,7 +408,7 @@ class ApiService {
 
     final decoded = await _request(
       'GET',
-      _uri('/api/friends/$normalized'),
+      _uri('/v1/friends/$normalized'),
     );
 
     return FriendsBundle.fromJson(decoded);
@@ -422,7 +422,7 @@ class ApiService {
   }) async {
     final decoded = await _request(
       'POST',
-      _uri('/api/friends/request'),
+      _uri('/v1/friends/request'),
       body: {
         'fromPublicId': fromPublicId.trim().toUpperCase(),
         'fromDeviceId': fromDeviceId.trim().toUpperCase(),
@@ -443,7 +443,7 @@ class ApiService {
   }) async {
     final decoded = await _request(
       'POST',
-      _uri('/api/friends/respond'),
+      _uri('/v1/friends/respond'),
       body: {
         'requestId': requestId,
         'actorPublicId': actorPublicId.trim().toUpperCase(),
