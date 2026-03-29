@@ -37,6 +37,7 @@ class DeviceKeyPackagePayload {
   final String deviceId;
   final String identityKeyAlg;
   final String identityKeyB64;
+  final String? identitySigningKeyB64;
   final String signedPrekeyB64;
   final String signedPrekeySignatureB64;
   final int signedPrekeyKeyId;
@@ -46,6 +47,7 @@ class DeviceKeyPackagePayload {
     required this.deviceId,
     required this.identityKeyAlg,
     required this.identityKeyB64,
+    required this.identitySigningKeyB64,
     required this.signedPrekeyB64,
     required this.signedPrekeySignatureB64,
     required this.signedPrekeyKeyId,
@@ -57,6 +59,7 @@ class DeviceKeyPackagePayload {
       'deviceId': deviceId,
       'identityKeyAlg': identityKeyAlg,
       'identityKeyB64': identityKeyB64,
+      'identitySigningKeyB64': identitySigningKeyB64,
       'signedPrekeyB64': signedPrekeyB64,
       'signedPrekeySignatureB64': signedPrekeySignatureB64,
       'signedPrekeyKeyId': signedPrekeyKeyId,
@@ -70,6 +73,7 @@ class ClaimedPrekeyBundle {
   final String deviceId;
   final String identityKeyAlg;
   final String identityKeyB64;
+  final String? identitySigningKeyB64;
   final String signedPrekeyB64;
   final String signedPrekeySignatureB64;
   final int signedPrekeyKeyId;
@@ -81,6 +85,7 @@ class ClaimedPrekeyBundle {
     required this.deviceId,
     required this.identityKeyAlg,
     required this.identityKeyB64,
+    required this.identitySigningKeyB64,
     required this.signedPrekeyB64,
     required this.signedPrekeySignatureB64,
     required this.signedPrekeyKeyId,
@@ -95,6 +100,7 @@ class ClaimedPrekeyBundle {
       deviceId: json['deviceId']?.toString() ?? '',
       identityKeyAlg: json['identityKeyAlg']?.toString() ?? '',
       identityKeyB64: json['identityKeyB64']?.toString() ?? '',
+      identitySigningKeyB64: json['identitySigningKeyB64']?.toString(),
       signedPrekeyB64: json['signedPrekeyB64']?.toString() ?? '',
       signedPrekeySignatureB64:
           json['signedPrekeySignatureB64']?.toString() ?? '',
@@ -241,6 +247,182 @@ class AckEnvelopeView {
       envelopeId: json['envelopeId']?.toString() ?? '',
       ackedAt: (json['ackedAt'] as num?)?.toInt() ?? 0,
       readAt: (json['readAt'] as num?)?.toInt(),
+    );
+  }
+}
+class FileRecipientKeyEnvelopePayload {
+  final String recipientPublicId;
+  final String recipientDeviceId;
+  final String wrappedFileKeyB64;
+  final Map<String, dynamic> metadata;
+
+  const FileRecipientKeyEnvelopePayload({
+    required this.recipientPublicId,
+    required this.recipientDeviceId,
+    required this.wrappedFileKeyB64,
+    required this.metadata,
+  });
+
+  Map<String, dynamic> toJson() {
+    return {
+      'recipientPublicId': recipientPublicId,
+      'recipientDeviceId': recipientDeviceId,
+      'wrappedFileKeyB64': wrappedFileKeyB64,
+      'metadata': metadata,
+    };
+  }
+}
+
+class CreateFileObjectPayload {
+  final String fileId;
+  final String uploaderDeviceId;
+  final String objectKey;
+  final String mediaType;
+  final String fileName;
+  final int ciphertextSize;
+  final int chunkSizeBytes;
+  final int totalChunks;
+  final String ciphertextSha256Hex;
+  final Map<String, dynamic> clientMetadata;
+  final List<FileRecipientKeyEnvelopePayload> recipientKeyEnvelopes;
+
+  const CreateFileObjectPayload({
+    required this.fileId,
+    required this.uploaderDeviceId,
+    required this.objectKey,
+    required this.mediaType,
+    required this.fileName,
+    required this.ciphertextSize,
+    required this.chunkSizeBytes,
+    required this.totalChunks,
+    required this.ciphertextSha256Hex,
+    required this.clientMetadata,
+    required this.recipientKeyEnvelopes,
+  });
+
+  Map<String, dynamic> toJson() {
+    return {
+      'fileId': fileId,
+      'uploaderDeviceId': uploaderDeviceId,
+      'objectKey': objectKey,
+      'mediaType': mediaType,
+      'fileName': fileName,
+      'ciphertextSize': ciphertextSize,
+      'chunkSizeBytes': chunkSizeBytes,
+      'totalChunks': totalChunks,
+      'ciphertextSha256Hex': ciphertextSha256Hex,
+      'clientMetadata': clientMetadata,
+      'recipientKeyEnvelopes': recipientKeyEnvelopes.map((e) => e.toJson()).toList(),
+    };
+  }
+}
+
+class FileObjectMailboxView {
+  final String fileId;
+  final String objectKey;
+  final String mediaType;
+  final String fileName;
+  final int ciphertextSize;
+  final int chunkSizeBytes;
+  final int totalChunks;
+  final String ciphertextSha256Hex;
+  final String uploadStatus;
+  final Map<String, dynamic> clientMetadata;
+  final int createdAt;
+  final int? completedAt;
+
+  const FileObjectMailboxView({
+    required this.fileId,
+    required this.objectKey,
+    required this.mediaType,
+    required this.fileName,
+    required this.ciphertextSize,
+    required this.chunkSizeBytes,
+    required this.totalChunks,
+    required this.ciphertextSha256Hex,
+    required this.uploadStatus,
+    required this.clientMetadata,
+    required this.createdAt,
+    required this.completedAt,
+  });
+
+  factory FileObjectMailboxView.fromJson(Map<String, dynamic> json) {
+    return FileObjectMailboxView(
+      fileId: json['fileId']?.toString() ?? '',
+      objectKey: json['objectKey']?.toString() ?? '',
+      mediaType: json['mediaType']?.toString() ?? '',
+      fileName: json['fileName']?.toString() ?? '',
+      ciphertextSize: (json['ciphertextSize'] as num?)?.toInt() ?? 0,
+      chunkSizeBytes: (json['chunkSizeBytes'] as num?)?.toInt() ?? 0,
+      totalChunks: (json['totalChunks'] as num?)?.toInt() ?? 0,
+      ciphertextSha256Hex: json['ciphertextSha256Hex']?.toString() ?? '',
+      uploadStatus: json['uploadStatus']?.toString() ?? '',
+      clientMetadata: json['clientMetadata'] is Map
+          ? (json['clientMetadata'] as Map)
+              .map((key, value) => MapEntry(key.toString(), value))
+          : const <String, dynamic>{},
+      createdAt: (json['createdAt'] as num?)?.toInt() ?? 0,
+      completedAt: (json['completedAt'] as num?)?.toInt(),
+    );
+  }
+}
+
+class FileKeyEnvelopeMailboxView {
+  final String fileId;
+  final String recipientPublicId;
+  final String recipientDeviceId;
+  final String wrappedFileKeyB64;
+  final Map<String, dynamic> metadata;
+  final int createdAt;
+
+  const FileKeyEnvelopeMailboxView({
+    required this.fileId,
+    required this.recipientPublicId,
+    required this.recipientDeviceId,
+    required this.wrappedFileKeyB64,
+    required this.metadata,
+    required this.createdAt,
+  });
+
+  factory FileKeyEnvelopeMailboxView.fromJson(Map<String, dynamic> json) {
+    return FileKeyEnvelopeMailboxView(
+      fileId: json['fileId']?.toString() ?? '',
+      recipientPublicId: json['recipientPublicId']?.toString() ?? '',
+      recipientDeviceId: json['recipientDeviceId']?.toString() ?? '',
+      wrappedFileKeyB64: json['wrappedFileKeyB64']?.toString() ?? '',
+      metadata: json['metadata'] is Map
+          ? (json['metadata'] as Map)
+              .map((key, value) => MapEntry(key.toString(), value))
+          : const <String, dynamic>{},
+      createdAt: (json['createdAt'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
+class FileLookupMailboxResponse {
+  final FileObjectMailboxView file;
+  final FileKeyEnvelopeMailboxView? keyEnvelope;
+
+  const FileLookupMailboxResponse({
+    required this.file,
+    required this.keyEnvelope,
+  });
+
+  factory FileLookupMailboxResponse.fromJson(Map<String, dynamic> json) {
+    final fileRaw = json['file'];
+    final keyRaw = json['keyEnvelope'];
+
+    return FileLookupMailboxResponse(
+      file: FileObjectMailboxView.fromJson(
+        fileRaw is Map
+            ? fileRaw.map((key, value) => MapEntry(key.toString(), value))
+            : const <String, dynamic>{},
+      ),
+      keyEnvelope: keyRaw is Map
+          ? FileKeyEnvelopeMailboxView.fromJson(
+              keyRaw.map((key, value) => MapEntry(key.toString(), value)),
+            )
+          : null,
     );
   }
 }

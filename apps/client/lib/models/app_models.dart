@@ -144,13 +144,6 @@ DateTime? _parseNullableDateTime(dynamic value) {
 
 int _toMillis(DateTime value) => value.millisecondsSinceEpoch;
 
-List<String> _toStringList(dynamic raw) {
-  if (raw is! List) {
-    return const [];
-  }
-  return raw.map((item) => item.toString()).toList();
-}
-
 class UserProfile {
   final String publicId;
   final String friendCode;
