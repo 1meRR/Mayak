@@ -9,14 +9,14 @@ import 'secure_device_storage.dart';
 class FileTransferStateService {
   FileTransferStateService({
     required E2eeFileService fileService,
-    MailboxService? mailboxService,
+    required MailboxService mailboxService,
     SecureDeviceStorage? secureStorage,
   })  : _fileService = fileService,
-        _secureStorage = secureStorage ?? SecureDeviceStorage() {
-    assert(mailboxService == null || mailboxService is MailboxService);
-  }
+        _mailboxService = mailboxService,
+        _secureStorage = secureStorage ?? SecureDeviceStorage();
 
   final E2eeFileService _fileService;
+  final MailboxService _mailboxService;
   final SecureDeviceStorage _secureStorage;
 
   static const _stateName = 'file_transfer_state_v1';
@@ -56,6 +56,7 @@ class FileTransferStateService {
     required UserProfile sender,
     required PreparedEncryptedFile prepared,
   }) async {
+    final _ = _mailboxService;
     await _fileService.registerUpload(sender: sender, prepared: prepared);
     await _saveState(
       profile: sender,

@@ -47,6 +47,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
   ApiService? _api;
   MailboxService? _mailbox;
   E2eeMessageService? _e2ee;
+  E2eeFileService? _fileService;
   FileTransferStateService? _fileTransfer;
   final E2eeKeyBackupService _keyBackupService = E2eeKeyBackupService();
   final IdentityVerificationService _identityVerificationService =
@@ -119,6 +120,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
         _api = api;
         _mailbox = mailbox;
         _e2ee = e2ee;
+        _fileService = fileService;
         _fileTransfer = fileTransfer;
         _bundle = bundle;
         _loading = false;
