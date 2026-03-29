@@ -1,4 +1,6 @@
 ﻿import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
@@ -6,9 +8,14 @@ import '../models/app_models.dart';
 import '../services/api_service.dart';
 import '../services/device_socket_service.dart';
 import '../services/e2ee/crypto_bridge.dart';
+import '../services/e2ee/e2ee_file_service.dart';
+import '../services/e2ee/e2ee_key_backup_service.dart';
 import '../services/e2ee/e2ee_message_service.dart';
+import '../services/e2ee/file_transfer_state_service.dart';
+import '../services/e2ee/identity_verification_service.dart';
 import '../services/e2ee/mailbox_service.dart';
 import '../services/e2ee/native_crypto_bridge.dart';
+import '../services/e2ee/software_crypto_bridge.dart';
 import '../services/local_message_store.dart';
 import '../services/settings_repository.dart';
 import 'add_friend_screen.dart';
@@ -38,7 +45,12 @@ class _AppShellScreenState extends State<AppShellScreen> {
   UserProfile? _profile;
   FriendsBundle? _bundle;
   ApiService? _api;
+  MailboxService? _mailbox;
   E2eeMessageService? _e2ee;
+  FileTransferStateService? _fileTransfer;
+  final E2eeKeyBackupService _keyBackupService = E2eeKeyBackupService();
+  final IdentityVerificationService _identityVerificationService =
+      IdentityVerificationService();
 
   Timer? _pollTimer;
   Timer? _incomingCallTimer;
@@ -81,21 +93,32 @@ class _AppShellScreenState extends State<AppShellScreen> {
       final profile = await _settings.ensureProfile();
       final api = ApiService(profile.serverUrl);
       final mailbox = MailboxService(profile.serverUrl);
+      final nativeBridge = NativeCryptoBridge();
+      final nativeStatus = await nativeBridge.getStatus();
+      final cryptoBridge =
+          nativeStatus.available ? nativeBridge : SoftwareCryptoBridge();
+
       final e2ee = E2eeMessageService(
         mailboxService: mailbox,
-        cryptoBridge: NativeCryptoBridge(),
+        cryptoBridge: cryptoBridge,
+      );
+      final fileService = E2eeFileService(mailboxService: mailbox);
+      final fileTransfer = FileTransferStateService(
+        fileService: fileService,
       );
 
       FriendsBundle? bundle;
       if (profile.registered && profile.publicId.trim().isNotEmpty) {
-        bundle = await api.fetchFriends(profile.publicId);
+        bundle = await _safeFetchFriends(api, profile);
       }
 
       if (!mounted) return;
       setState(() {
         _profile = profile;
         _api = api;
+        _mailbox = mailbox;
         _e2ee = e2ee;
+        _fileTransfer = fileTransfer;
         _bundle = bundle;
         _loading = false;
       });
@@ -157,7 +180,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
     _syncing = true;
     try {
-      final nextBundle = await api.fetchFriends(profile.publicId);
+      final nextBundle = await _safeFetchFriends(api, profile);
 
       if (!mounted) return;
       setState(() {
@@ -169,6 +192,23 @@ class _AppShellScreenState extends State<AppShellScreen> {
       debugPrint('Background sync failed: $e');
     } finally {
       _syncing = false;
+    }
+  }
+
+  Future<FriendsBundle> _safeFetchFriends(
+    ApiService api,
+    UserProfile profile,
+  ) async {
+    try {
+      return await api.fetchFriends(profile.publicId);
+    } catch (e) {
+      if (e.toString().contains('HTTP 404')) {
+        debugPrint(
+          'Friends API is unavailable on server ${profile.serverUrl}; using empty friend bundle fallback.',
+        );
+        return FriendsBundle.empty(profile.publicId);
+      }
+      rethrow;
     }
   }
 
@@ -441,6 +481,113 @@ class _AppShellScreenState extends State<AppShellScreen> {
     await _backgroundSync(force: true);
   }
 
+  Future<String> _createEncryptedKeyBackup(String passphrase) async {
+    final profile = _profile;
+    if (profile == null) {
+      throw Exception('Профиль недоступен');
+    }
+
+    return _keyBackupService.createEncryptedBackup(
+      profile: profile,
+      recoveryPassphrase: passphrase,
+    );
+  }
+
+  Future<void> _restoreEncryptedKeyBackup({
+    required String passphrase,
+    required String backupBlob,
+  }) async {
+    final profile = _profile;
+    if (profile == null) {
+      throw Exception('Профиль недоступен');
+    }
+
+    await _keyBackupService.restoreEncryptedBackup(
+      profile: profile,
+      recoveryPassphrase: passphrase,
+      backupBlobB64: backupBlob,
+    );
+  }
+
+  Future<String> _buildSafetyNumber(FriendUser friend) async {
+    final profile = _profile;
+    final mailbox = _mailbox;
+    if (profile == null || mailbox == null) {
+      throw Exception('Нет активной сессии');
+    }
+
+    final myClaim = await mailbox.claimPrekey(
+      targetPublicId: profile.publicId,
+      targetDeviceId: profile.deviceId,
+    );
+
+    final peerDevices = await mailbox.listDevicesRaw(friend.publicId);
+    if (peerDevices.isEmpty) {
+      throw Exception('У собеседника нет устройств');
+    }
+
+    final peerClaim = await mailbox.claimPrekey(
+      targetPublicId: friend.publicId,
+      targetDeviceId: peerDevices.first.deviceId,
+    );
+
+    return _identityVerificationService.buildSafetyNumber(
+      localPublicId: profile.publicId,
+      localDeviceId: profile.deviceId,
+      localIdentityKeyB64: myClaim.identityKeyB64,
+      remotePublicId: friend.publicId,
+      remoteDeviceId: peerClaim.deviceId,
+      remoteIdentityKeyB64: peerClaim.identityKeyB64,
+    );
+  }
+
+  Future<void> _sendDemoEncryptedFile(FriendUser friend, String label) async {
+    final profile = _profile;
+    final mailbox = _mailbox;
+    final transfer = _fileTransfer;
+
+    if (profile == null || mailbox == null || transfer == null) {
+      throw Exception('File service недоступен');
+    }
+
+    final devices = await mailbox.listDevicesRaw(friend.publicId);
+    if (devices.isEmpty) {
+      throw Exception('У получателя нет устройств');
+    }
+
+    final recipients = <CryptoFileRecipientBundle>[];
+    for (final device in devices) {
+      final claim = await mailbox.claimPrekey(
+        targetPublicId: friend.publicId,
+        targetDeviceId: device.deviceId,
+      );
+      recipients.add(
+        CryptoFileRecipientBundle(
+          publicId: claim.publicId,
+          deviceId: claim.deviceId,
+          signedPrekeyB64: claim.signedPrekeyB64,
+        ),
+      );
+    }
+
+    final bytes = Uint8List.fromList(
+      utf8.encode('mayak_demo_file:${DateTime.now().toIso8601String()}:$label'),
+    );
+
+    final prepared = await transfer.prepareAndPersistUpload(
+      sender: profile,
+      fileName: 'demo_${DateTime.now().millisecondsSinceEpoch}.txt',
+      mediaType: 'text/plain',
+      plaintext: bytes,
+      recipients: recipients,
+    );
+
+    await transfer.registerAndMarkCompleted(
+      sender: profile,
+      prepared: prepared,
+    );
+  }
+
   Future<void> _openChat(FriendUser friend) async {
     final profile = _profile;
     final e2ee = _e2ee;
@@ -454,6 +601,8 @@ class _AppShellScreenState extends State<AppShellScreen> {
           store: _messageStore,
           e2ee: e2ee,
           onSyncRequested: _backgroundMailboxSync,
+          onSafetyNumberRequested: () => _buildSafetyNumber(friend),
+          onSendFileRequested: (label) => _sendDemoEncryptedFile(friend, label),
         ),
       ),
     );
@@ -523,6 +672,8 @@ class _AppShellScreenState extends State<AppShellScreen> {
             await _reload();
           },
           onLogout: _logout,
+          onCreateKeyBackup: _createEncryptedKeyBackup,
+          onRestoreKeyBackup: _restoreEncryptedKeyBackup,
         );
       default:
         return FriendsScreen(
@@ -569,7 +720,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
           profile != null && profile.registered && _currentIndex == 0
               ? FloatingActionButton(
                   onPressed: _openAddFriend,
-                  child: const Icon(Icons.person_add_alt_1.person_add_alt_1.person_add_alt_1_rounded),
+                  child: const Icon(Icons.person_add_alt_1_rounded),
                 )
               : null,
     );

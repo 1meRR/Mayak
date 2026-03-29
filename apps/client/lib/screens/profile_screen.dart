@@ -9,11 +9,16 @@ class ProfileScreen extends StatefulWidget {
     required this.profile,
     required this.onSave,
     required this.onLogout,
+    required this.onCreateKeyBackup,
+    required this.onRestoreKeyBackup,
   });
 
   final UserProfile profile;
   final Future<void> Function(UserProfile updated) onSave;
   final Future<void> Function() onLogout;
+  final Future<String> Function(String passphrase) onCreateKeyBackup;
+  final Future<void> Function({required String passphrase, required String backupBlob})
+      onRestoreKeyBackup;
 
   @override
   State<ProfileScreen> createState() => _ProfileScreenState();
@@ -25,6 +30,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   late final TextEditingController _aboutController;
 
   bool _saving = false;
+  bool _backupBusy = false;
 
   @override
   void initState() {
@@ -74,6 +80,137 @@ class _ProfileScreenState extends State<ProfileScreen> {
         setState(() {
           _saving = false;
         });
+      }
+    }
+  }
+
+  Future<String?> _askPassphrase(String title) async {
+    final ctrl = TextEditingController();
+    final value = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(title),
+          content: TextField(
+            controller: ctrl,
+            obscureText: true,
+            decoration: const InputDecoration(
+              labelText: 'Recovery passphrase',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(ctrl.text.trim()),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+
+    ctrl.dispose();
+    if (value == null || value.isEmpty) {
+      return null;
+    }
+    return value;
+  }
+
+  Future<void> _createBackup() async {
+    if (_backupBusy) return;
+
+    final passphrase = await _askPassphrase('Создать encrypted backup');
+    if (passphrase == null) return;
+
+    setState(() => _backupBusy = true);
+    try {
+      final blob = await widget.onCreateKeyBackup(passphrase);
+      if (!mounted) return;
+
+      await showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Backup blob'),
+          content: SingleChildScrollView(
+            child: SelectableText(blob),
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Закрыть'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ошибка backup: $e')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _backupBusy = false);
+      }
+    }
+  }
+
+  Future<void> _restoreBackup() async {
+    if (_backupBusy) return;
+
+    final passphrase = await _askPassphrase('Восстановить encrypted backup');
+    if (passphrase == null) return;
+    if (!mounted) return;
+
+    final blobCtrl = TextEditingController();
+    final blob = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Вставь backup blob'),
+        content: TextField(
+          controller: blobCtrl,
+          minLines: 3,
+          maxLines: 8,
+          decoration: const InputDecoration(
+            hintText: 'Base64 backup blob',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(blobCtrl.text.trim()),
+            child: const Text('Восстановить'),
+          ),
+        ],
+      ),
+    );
+    blobCtrl.dispose();
+
+    if (blob == null || blob.isEmpty) return;
+
+    setState(() => _backupBusy = true);
+    try {
+      await widget.onRestoreKeyBackup(
+        passphrase: passphrase,
+        backupBlob: blob,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Backup успешно восстановлен')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ошибка restore: $e')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _backupBusy = false);
       }
     }
   }
@@ -152,6 +289,37 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           )
                         : const Icon(Icons.save_rounded),
                     label: const Text('Сохранить'),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 18),
+            GlassPanel(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Backup / Recovery', style: theme.textTheme.titleLarge),
+                  const SizedBox(height: 10),
+                  Text(
+                    'Создай encrypted backup E2EE ключей и восстанови его на устройстве через recovery passphrase.',
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      FilledButton.icon(
+                        onPressed: _backupBusy ? null : _createBackup,
+                        icon: const Icon(Icons.backup_rounded),
+                        label: const Text('Создать backup'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: _backupBusy ? null : _restoreBackup,
+                        icon: const Icon(Icons.restore_rounded),
+                        label: const Text('Восстановить'),
+                      ),
+                    ],
                   ),
                 ],
               ),

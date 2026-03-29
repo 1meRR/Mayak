@@ -1,4 +1,4 @@
-﻿use crate::domain::models::{
+use crate::domain::models::{
     AckEnvelopeResponse, CreateFileObjectRequest, DeviceDirectoryView, DeviceKeyPackageView,
     FileKeyEnvelopeView, FileLookupResponse, FileObjectView, LoginResponse, RecipientEnvelopeInput,
     RegisterRequest, StoredEnvelopeView, UpsertDeviceKeyPackageRequest, UserProfileView,
@@ -109,8 +109,7 @@ impl PostgresStore {
         .ok_or_else(|| "Неверный телефон или пароль".to_string())?;
 
         let password_hash_value: String = user_row.get("password_hash");
-        let parsed_hash = PasswordHash::new(&password_hash_value)
-            .map_err(|e| e.to_string())?;
+        let parsed_hash = PasswordHash::new(&password_hash_value).map_err(|e| e.to_string())?;
         Argon2::default()
             .verify_password(password.as_bytes(), &parsed_hash)
             .map_err(|_| "Неверный телефон или пароль".to_string())?;
@@ -210,7 +209,9 @@ impl PostgresStore {
     ) -> Result<DeviceKeyPackageView, String> {
         let device_id = normalize_device_id(&req.device_id);
         if device_id != auth.device_id {
-            return Err("device_id в bundle должен совпадать с авторизованным устройством".to_string());
+            return Err(
+                "device_id в bundle должен совпадать с авторизованным устройством".to_string(),
+            );
         }
 
         sqlx::query(
@@ -220,17 +221,19 @@ impl PostgresStore {
                 device_id,
                 identity_key_alg,
                 identity_key_b64,
+                identity_signing_key_b64,
                 signed_prekey_b64,
                 signed_prekey_signature_b64,
                 signed_prekey_key_id,
                 one_time_prekeys,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
             ON CONFLICT (user_id, device_id)
             DO UPDATE SET
                 identity_key_alg = EXCLUDED.identity_key_alg,
                 identity_key_b64 = EXCLUDED.identity_key_b64,
+                identity_signing_key_b64 = EXCLUDED.identity_signing_key_b64,
                 signed_prekey_b64 = EXCLUDED.signed_prekey_b64,
                 signed_prekey_signature_b64 = EXCLUDED.signed_prekey_signature_b64,
                 signed_prekey_key_id = EXCLUDED.signed_prekey_key_id,
@@ -243,6 +246,12 @@ impl PostgresStore {
         .bind(&device_id)
         .bind(req.identity_key_alg.trim())
         .bind(req.identity_key_b64.trim())
+        .bind(
+            req.identity_signing_key_b64
+                .as_deref()
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty()),
+        )
         .bind(req.signed_prekey_b64.trim())
         .bind(req.signed_prekey_signature_b64.trim())
         .bind(req.signed_prekey_key_id)
@@ -255,7 +264,10 @@ impl PostgresStore {
             .await
     }
 
-    pub async fn list_user_devices(&self, public_id: &str) -> Result<Vec<DeviceDirectoryView>, String> {
+    pub async fn list_user_devices(
+        &self,
+        public_id: &str,
+    ) -> Result<Vec<DeviceDirectoryView>, String> {
         let rows = sqlx::query(
             r#"
             SELECT
@@ -303,6 +315,7 @@ impl PostgresStore {
                 k.device_id AS device_id,
                 k.identity_key_alg AS identity_key_alg,
                 k.identity_key_b64 AS identity_key_b64,
+                k.identity_signing_key_b64 AS identity_signing_key_b64,
                 k.signed_prekey_b64 AS signed_prekey_b64,
                 k.signed_prekey_signature_b64 AS signed_prekey_signature_b64,
                 k.signed_prekey_key_id AS signed_prekey_key_id,
@@ -338,6 +351,7 @@ impl PostgresStore {
                 k.device_id AS device_id,
                 k.identity_key_alg AS identity_key_alg,
                 k.identity_key_b64 AS identity_key_b64,
+                k.identity_signing_key_b64 AS identity_signing_key_b64,
                 k.signed_prekey_b64 AS signed_prekey_b64,
                 k.signed_prekey_signature_b64 AS signed_prekey_signature_b64,
                 k.signed_prekey_key_id AS signed_prekey_key_id,
@@ -387,6 +401,10 @@ impl PostgresStore {
             device_id: dev_id,
             identity_key_alg: row.get("identity_key_alg"),
             identity_key_b64: row.get("identity_key_b64"),
+            identity_signing_key_b64: row
+                .try_get::<Option<String>, _>("identity_signing_key_b64")
+                .ok()
+                .flatten(),
             signed_prekey_b64: row.get("signed_prekey_b64"),
             signed_prekey_signature_b64: row.get("signed_prekey_signature_b64"),
             signed_prekey_key_id: row.get("signed_prekey_key_id"),
@@ -404,7 +422,9 @@ impl PostgresStore {
     ) -> Result<Vec<StoredEnvelopeView>, String> {
         let sender_device_id = normalize_device_id(sender_device_id);
         if sender_device_id != auth.device_id {
-            return Err("sender_device_id должен совпадать с авторизованным устройством".to_string());
+            return Err(
+                "sender_device_id должен совпадать с авторизованным устройством".to_string(),
+            );
         }
 
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
@@ -415,14 +435,13 @@ impl PostgresStore {
             let recipient_device_id = normalize_device_id(&recipient.recipient_device_id);
             let envelope_id = format!("ENV{}", random_upper_alnum(20));
 
-            let recipient_user_id: Uuid = sqlx::query_scalar(
-                "SELECT id FROM users WHERE public_id = $1",
-            )
-            .bind(&recipient_public_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Пользователь {} не найден", recipient_public_id))?;
+            let recipient_user_id: Uuid =
+                sqlx::query_scalar("SELECT id FROM users WHERE public_id = $1")
+                    .bind(&recipient_public_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("Пользователь {} не найден", recipient_public_id))?;
 
             sqlx::query(
                 r#"
@@ -588,7 +607,9 @@ impl PostgresStore {
     ) -> Result<FileObjectView, String> {
         let uploader_device_id = normalize_device_id(&req.uploader_device_id);
         if uploader_device_id != auth.device_id {
-            return Err("uploader_device_id должен совпадать с авторизованным устройством".to_string());
+            return Err(
+                "uploader_device_id должен совпадать с авторизованным устройством".to_string(),
+            );
         }
 
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
@@ -627,14 +648,13 @@ impl PostgresStore {
         .map_err(|e| e.to_string())?;
 
         for env in req.recipient_key_envelopes {
-            let recipient_user_id: Uuid = sqlx::query_scalar(
-                "SELECT id FROM users WHERE public_id = $1",
-            )
-            .bind(env.recipient_public_id.trim())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Пользователь {} не найден", env.recipient_public_id))?;
+            let recipient_user_id: Uuid =
+                sqlx::query_scalar("SELECT id FROM users WHERE public_id = $1")
+                    .bind(env.recipient_public_id.trim())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("Пользователь {} не найден", env.recipient_public_id))?;
 
             sqlx::query(
                 r#"
@@ -706,6 +726,64 @@ impl PostgresStore {
         Ok(row_to_file_object(row))
     }
 
+    pub async fn ensure_file_uploader(
+        &self,
+        auth: &AuthenticatedDevice,
+        file_id: &str,
+    ) -> Result<(), String> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM file_objects WHERE file_id = $1 AND uploader_user_id = $2 AND uploader_device_id = $3",
+        )
+        .bind(file_id.trim())
+        .bind(auth.user_id)
+        .bind(&auth.device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if exists.is_some() {
+            Ok(())
+        } else {
+            Err("Нет доступа на upload file chunks".to_string())
+        }
+    }
+
+    pub async fn ensure_file_downloadable(
+        &self,
+        auth: &AuthenticatedDevice,
+        file_id: &str,
+    ) -> Result<(), String> {
+        let allowed: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT 1
+            FROM file_objects f
+            WHERE f.file_id = $1
+              AND (
+                    (f.uploader_user_id = $2 AND f.uploader_device_id = $3)
+                    OR EXISTS (
+                        SELECT 1
+                        FROM file_key_envelopes e
+                        WHERE e.file_id = f.file_id
+                          AND e.recipient_user_id = $2
+                          AND e.recipient_device_id = $3
+                    )
+              )
+            "#,
+        )
+        .bind(file_id.trim())
+        .bind(auth.user_id)
+        .bind(&auth.device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if allowed.is_some() {
+            Ok(())
+        } else {
+            Err("Нет доступа на download file content".to_string())
+        }
+    }
+
     pub async fn get_file_for_recipient(
         &self,
         auth: &AuthenticatedDevice,
@@ -772,6 +850,10 @@ fn row_to_device_key_package(row: sqlx::postgres::PgRow) -> DeviceKeyPackageView
         device_id: row.get("device_id"),
         identity_key_alg: row.get("identity_key_alg"),
         identity_key_b64: row.get("identity_key_b64"),
+        identity_signing_key_b64: row
+            .try_get::<Option<String>, _>("identity_signing_key_b64")
+            .ok()
+            .flatten(),
         signed_prekey_b64: row.get("signed_prekey_b64"),
         signed_prekey_signature_b64: row.get("signed_prekey_signature_b64"),
         signed_prekey_key_id: row.get("signed_prekey_key_id"),
@@ -794,7 +876,10 @@ fn row_to_envelope(row: sqlx::postgres::PgRow) -> StoredEnvelopeView {
         ciphertext_b64: row.get("ciphertext_b64"),
         metadata: row.get("server_metadata"),
         created_at: row.get::<i64, _>("created_at_ms"),
-        delivered_at: row.try_get::<Option<i64>, _>("delivered_at_ms").ok().flatten(),
+        delivered_at: row
+            .try_get::<Option<i64>, _>("delivered_at_ms")
+            .ok()
+            .flatten(),
         acked_at: row.try_get::<Option<i64>, _>("acked_at_ms").ok().flatten(),
         read_at: row.try_get::<Option<i64>, _>("read_at_ms").ok().flatten(),
         server_seq: row.get("server_seq"),
@@ -814,7 +899,10 @@ fn row_to_file_object(row: sqlx::postgres::PgRow) -> FileObjectView {
         upload_status: row.get("upload_status"),
         client_metadata: row.get("client_metadata"),
         created_at: row.get::<i64, _>("created_at_ms"),
-        completed_at: row.try_get::<Option<i64>, _>("completed_at_ms").ok().flatten(),
+        completed_at: row
+            .try_get::<Option<i64>, _>("completed_at_ms")
+            .ok()
+            .flatten(),
     }
 }
 
@@ -865,7 +953,10 @@ fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let bytes = hasher.finalize();
-    bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
 }
 
 fn normalize_phone(phone: &str) -> Result<String, String> {

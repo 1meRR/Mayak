@@ -139,7 +139,7 @@ class DirectMessageQueueService {
         'supportsCalls': true,
         'supportsDirectMessages': true,
         'supportsLocalQueue': true,
-        'supportsFiles': false,
+        'supportsFiles': true,
       },
     );
 
