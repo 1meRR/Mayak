@@ -111,7 +111,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
       FriendsBundle? bundle;
       if (profile.registered && profile.publicId.trim().isNotEmpty) {
-        bundle = await api.fetchFriends(profile.publicId);
+        bundle = await _safeFetchFriends(api, profile);
       }
 
       if (!mounted) return;
@@ -183,7 +183,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
     _syncing = true;
     try {
-      final nextBundle = await api.fetchFriends(profile.publicId);
+      final nextBundle = await _safeFetchFriends(api, profile);
 
       if (!mounted) return;
       setState(() {
@@ -195,6 +195,23 @@ class _AppShellScreenState extends State<AppShellScreen> {
       debugPrint('Background sync failed: $e');
     } finally {
       _syncing = false;
+    }
+  }
+
+  Future<FriendsBundle> _safeFetchFriends(
+    ApiService api,
+    UserProfile profile,
+  ) async {
+    try {
+      return await api.fetchFriends(profile.publicId);
+    } catch (e) {
+      if (e.toString().contains('HTTP 404')) {
+        debugPrint(
+          'Friends API is unavailable on server ${profile.serverUrl}; using empty friend bundle fallback.',
+        );
+        return FriendsBundle.empty(profile.publicId);
+      }
+      rethrow;
     }
   }
 
