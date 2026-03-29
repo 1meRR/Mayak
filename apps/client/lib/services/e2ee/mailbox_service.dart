@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
@@ -269,4 +270,93 @@ class MailboxService {
 
     return AckEnvelopeView.fromJson(decoded);
   }
+
+  Future<FileObjectMailboxView> createFileObject({
+    required UserProfile profile,
+    required CreateFileObjectPayload payload,
+  }) async {
+    final decoded = await _request(
+      'POST',
+      _uri('/v1/files'),
+      bearerToken: profile.sessionToken,
+      body: payload.toJson(),
+    );
+
+    return FileObjectMailboxView.fromJson(decoded);
+  }
+
+  Future<FileObjectMailboxView> completeFileObject({
+    required UserProfile profile,
+    required String fileId,
+    String uploadStatus = 'completed',
+  }) async {
+    final decoded = await _request(
+      'POST',
+      _uri('/v1/files/${fileId.trim()}/complete'),
+      bearerToken: profile.sessionToken,
+      deviceIdHeader: profile.deviceId,
+      body: {
+        'uploadStatus': uploadStatus,
+      },
+    );
+
+    return FileObjectMailboxView.fromJson(decoded);
+  }
+
+  Future<FileLookupMailboxResponse> getFileForDevice({
+    required UserProfile profile,
+    required String fileId,
+  }) async {
+    final decoded = await _request(
+      'GET',
+      _uri('/v1/files/${fileId.trim()}'),
+      bearerToken: profile.sessionToken,
+      deviceIdHeader: profile.deviceId,
+    );
+
+    return FileLookupMailboxResponse.fromJson(decoded);
+  }
+  Future<void> uploadFileChunk({
+    required UserProfile profile,
+    required String fileId,
+    required int chunkIndex,
+    required List<int> bytes,
+  }) async {
+    final response = await http.post(
+      _uri('/v1/files/${fileId.trim()}/chunks/$chunkIndex'),
+      headers: _headers(
+        json: false,
+        bearerToken: profile.sessionToken,
+        deviceId: profile.deviceId,
+      ),
+      body: bytes,
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      final decoded = await _decode(response);
+      throw Exception(decoded['error']?.toString() ?? 'HTTP ${response.statusCode}');
+    }
+  }
+
+  Future<Uint8List> downloadFileCiphertext({
+    required UserProfile profile,
+    required String fileId,
+  }) async {
+    final response = await http.get(
+      _uri('/v1/files/${fileId.trim()}/content'),
+      headers: _headers(
+        json: false,
+        bearerToken: profile.sessionToken,
+        deviceId: profile.deviceId,
+      ),
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      final decoded = await _decode(response);
+      throw Exception(decoded['error']?.toString() ?? 'HTTP ${response.statusCode}');
+    }
+
+    return response.bodyBytes;
+  }
+
 }
