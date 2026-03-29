@@ -23,6 +23,7 @@ import 'chat_screen.dart';
 import 'friends_screen.dart';
 import 'incoming_call_screen.dart';
 import 'onboarding_screen.dart';
+import 'outgoing_call_screen.dart';
 import 'profile_screen.dart';
 
 class AppShellScreen extends StatefulWidget {
@@ -613,6 +614,26 @@ class _AppShellScreenState extends State<AppShellScreen> {
     await _backgroundSync(force: true);
   }
 
+  Future<void> _startCall(FriendUser friend) async {
+    final profile = _profile;
+    final api = _api;
+    if (profile == null || api == null) return;
+    if (!profile.hasActiveSession) return;
+
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => OutgoingCallScreen(
+          profile: profile,
+          friend: friend,
+          api: api,
+          socket: _deviceSocket,
+        ),
+      ),
+    );
+
+    await _backgroundSync(force: true);
+  }
+
   Widget _buildBody() {
     if (_loading) {
       return const Center(child: CircularProgressIndicator());
@@ -663,6 +684,8 @@ class _AppShellScreenState extends State<AppShellScreen> {
           incomingRequests: bundle.incomingRequests,
           outgoingRequests: bundle.outgoingRequests,
           onOpenChat: _openChat,
+          onStartAudioCall: _startCall,
+          onStartVideoCall: _startCall,
           onAcceptRequest: _acceptRequest,
           onRejectRequest: _rejectRequest,
           onRefresh: () => _backgroundSync(force: true),
@@ -685,6 +708,8 @@ class _AppShellScreenState extends State<AppShellScreen> {
           incomingRequests: bundle.incomingRequests,
           outgoingRequests: bundle.outgoingRequests,
           onOpenChat: _openChat,
+          onStartAudioCall: _startCall,
+          onStartVideoCall: _startCall,
           onAcceptRequest: _acceptRequest,
           onRejectRequest: _rejectRequest,
           onRefresh: () => _backgroundSync(force: true),
