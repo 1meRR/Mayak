@@ -14,8 +14,10 @@ use axum::{
 };
 use domain::models::{
     AckEnvelopeRequest, ClaimPrekeyRequest, CompleteFileObjectRequest, CreateFileObjectRequest,
-    ErrorResponse, LoginRequest, PendingMessagesQuery, PendingMessagesResponse, RegisterRequest,
+    CreateFriendRequestRequest, ErrorResponse, LoginRequest, PendingMessagesQuery,
+    PendingMessagesResponse, RegisterRequest, RespondFriendRequestRequest,
     SendEncryptedMessageRequest, SendEncryptedMessageResponse, UpsertDeviceKeyPackageRequest,
+    UserLookupResponse,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde_json::json;
@@ -59,6 +61,14 @@ async fn main() {
         .route("/v1/auth/register", post(register))
         .route("/v1/auth/login", post(login))
         .route("/v1/users/{public_id}/devices", get(list_user_devices))
+        .route("/v1/users/by-public-id/{public_id}", get(lookup_user_by_public_id))
+        .route(
+            "/v1/users/by-friend-code/{friend_code}",
+            get(lookup_user_by_friend_code),
+        )
+        .route("/v1/friends/{public_id}", get(fetch_friends_bundle))
+        .route("/v1/friends/request", post(create_friend_request))
+        .route("/v1/friends/respond", post(respond_friend_request))
         .route("/v1/prekeys/claim", post(claim_prekey))
         .route("/v1/devices/key-package", post(upsert_device_key_package))
         .route("/v1/messages/send", post(send_encrypted_messages))
@@ -130,6 +140,75 @@ async fn list_user_devices(
 ) -> Response {
     match state.store.list_user_devices(&public_id).await {
         Ok(items) => (StatusCode::OK, Json(items)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn lookup_user_by_public_id(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+) -> Response {
+    match state.store.lookup_user_by_public_id(&public_id).await {
+        Ok(user) => (StatusCode::OK, Json(UserLookupResponse { user })).into_response(),
+        Err(err) => error_response(StatusCode::NOT_FOUND, err),
+    }
+}
+
+async fn lookup_user_by_friend_code(
+    State(state): State<AppState>,
+    Path(friend_code): Path<String>,
+) -> Response {
+    match state.store.lookup_user_by_friend_code(&friend_code).await {
+        Ok(user) => (StatusCode::OK, Json(UserLookupResponse { user })).into_response(),
+        Err(err) => error_response(StatusCode::NOT_FOUND, err),
+    }
+}
+
+async fn fetch_friends_bundle(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+) -> Response {
+    match state.store.fetch_friends_bundle(&public_id).await {
+        Ok(bundle) => (StatusCode::OK, Json(bundle)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn create_friend_request(
+    State(state): State<AppState>,
+    Json(req): Json<CreateFriendRequestRequest>,
+) -> Response {
+    match state
+        .store
+        .create_friend_request(
+            &req.from_public_id,
+            &req.from_device_id,
+            &req.session_token,
+            &req.to_public_id,
+        )
+        .await
+    {
+        Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn respond_friend_request(
+    State(state): State<AppState>,
+    Json(req): Json<RespondFriendRequestRequest>,
+) -> Response {
+    match state
+        .store
+        .respond_friend_request(
+            &req.request_id,
+            &req.actor_public_id,
+            &req.actor_device_id,
+            &req.session_token,
+            &req.action,
+        )
+        .await
+    {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
         Err(err) => error_response(StatusCode::BAD_REQUEST, err),
     }
 }
