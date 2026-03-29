@@ -69,7 +69,7 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
       });
     } catch (error) {
       final message = error.toString().contains('HTTP 404')
-          ? 'Этот сервер не поддерживает поиск друзей (/api/users/*). '
+          ? 'Этот сервер не поддерживает поиск друзей (/v1/users/*). '
               'Нужен backend с friends API.'
           : 'Поиск не удался: $error';
       if (!mounted) return;
@@ -126,7 +126,7 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
       await widget.onFriendRequestSent();
     } catch (error) {
       final message = error.toString().contains('HTTP 404')
-          ? 'Этот сервер не поддерживает отправку заявок (/api/friends/*).'
+          ? 'Этот сервер не поддерживает отправку заявок (/v1/friends/*).'
           : 'Не удалось отправить заявку: $error';
       if (!mounted) return;
       setState(() {
