@@ -43,7 +43,21 @@ class MayakRootApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
       theme: buildAppTheme(),
+      scrollBehavior: const _NoStretchScrollBehavior(),
       home: const AppShellScreen(),
     );
+  }
+}
+
+class _NoStretchScrollBehavior extends MaterialScrollBehavior {
+  const _NoStretchScrollBehavior();
+
+  @override
+  Widget buildOverscrollIndicator(
+    BuildContext context,
+    Widget child,
+    ScrollableDetails details,
+  ) {
+    return child;
   }
 }
