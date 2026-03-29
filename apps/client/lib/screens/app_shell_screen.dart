@@ -105,6 +105,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
       final fileService = E2eeFileService(mailboxService: mailbox);
       final fileTransfer = FileTransferStateService(
         fileService: fileService,
+        mailboxService: mailbox,
       );
 
       FriendsBundle? bundle;

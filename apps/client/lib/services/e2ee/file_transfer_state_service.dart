@@ -3,14 +3,18 @@ import 'dart:typed_data';
 
 import '../../models/app_models.dart';
 import 'e2ee_file_service.dart';
+import 'mailbox_service.dart';
 import 'secure_device_storage.dart';
 
 class FileTransferStateService {
   FileTransferStateService({
     required E2eeFileService fileService,
+    MailboxService? mailboxService,
     SecureDeviceStorage? secureStorage,
   })  : _fileService = fileService,
-        _secureStorage = secureStorage ?? SecureDeviceStorage();
+        _secureStorage = secureStorage ?? SecureDeviceStorage() {
+    assert(mailboxService == null || mailboxService is MailboxService);
+  }
 
   final E2eeFileService _fileService;
   final SecureDeviceStorage _secureStorage;
