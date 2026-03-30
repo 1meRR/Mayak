@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../models/app_models.dart';
@@ -20,23 +21,6 @@ class DeviceSocketService {
   Stream<DeviceSignalMessage> get messages => _messagesController.stream;
   Stream<bool> get connectionState => _connectedController.stream;
   bool get isConnected => _connected;
-
-  Uri _buildLegacyDeviceWsUri(UserProfile profile) {
-    final base = Uri.parse(profile.serverUrl);
-    final scheme =
-        base.scheme == 'https' || base.scheme == 'wss' ? 'wss' : 'ws';
-
-    return Uri(
-      scheme: scheme,
-      host: base.host,
-      port: base.hasPort ? base.port : null,
-      path:
-          '/ws/device/${Uri.encodeComponent(profile.publicId)}/${Uri.encodeComponent(profile.deviceId)}',
-      queryParameters: {
-        'token': profile.sessionToken,
-      },
-    );
-  }
 
   Uri _buildMailboxWsUri(UserProfile profile) {
     final base = Uri.parse(profile.serverUrl);
@@ -61,32 +45,31 @@ class DeviceSocketService {
     }
 
     final mailboxUri = _buildMailboxWsUri(profile);
-    final legacyUri = _buildLegacyDeviceWsUri(profile);
-
     final mailboxUrl = mailboxUri.toString();
-    final legacyUrl = legacyUri.toString();
 
-    if (_connected &&
-        (_activeUrl == mailboxUrl || _activeUrl == legacyUrl)) {
+    if (_connected && _activeUrl == mailboxUrl) {
       return;
     }
 
     await disconnect();
 
-    try {
-      await _connectInternal(mailboxUri);
-      _activeUrl = mailboxUrl;
-      return;
-    } catch (_) {
-      await disconnect();
-    }
+    final mailboxHeaders = <String, dynamic>{
+      'authorization': 'Bearer ${profile.sessionToken.trim()}',
+      'x-device-id': profile.deviceId.trim().toUpperCase(),
+    };
 
-    await _connectInternal(legacyUri);
-    _activeUrl = legacyUrl;
+    await _connectInternal(mailboxUri, headers: mailboxHeaders);
+    _activeUrl = mailboxUrl;
   }
 
-  Future<void> _connectInternal(Uri uri) async {
-    final channel = WebSocketChannel.connect(uri);
+  Future<void> _connectInternal(
+    Uri uri, {
+    Map<String, dynamic>? headers,
+  }) async {
+    final channel = IOWebSocketChannel.connect(
+      uri,
+      headers: headers,
+    );
     _channel = channel;
 
     final ready = Completer<void>();
