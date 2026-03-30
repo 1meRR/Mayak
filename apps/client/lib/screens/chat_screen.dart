@@ -1,7 +1,11 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:mime/mime.dart';
 
 import '../models/app_models.dart';
 import '../services/e2ee/e2ee_message_service.dart';
@@ -25,7 +29,11 @@ class ChatScreen extends StatefulWidget {
   final E2eeMessageService e2ee;
   final Future<void> Function()? onSyncRequested;
   final Future<String> Function()? onSafetyNumberRequested;
-  final Future<void> Function(String label)? onSendFileRequested;
+  final Future<void> Function({
+    required Uint8List bytes,
+    required String fileName,
+    required String mediaType,
+  })? onSendFileRequested;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -143,17 +151,48 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _sendDemoFile() async {
+  Future<void> _pickAndSendFile() async {
     if (_isSendingFile || widget.onSendFileRequested == null) {
       return;
     }
 
     setState(() => _isSendingFile = true);
     try {
-      await widget.onSendFileRequested!.call(_textController.text.trim());
+      final picked = await FilePicker.platform.pickFiles(
+        type: FileType.any,
+        withData: true,
+      );
+
+      if (picked == null || picked.files.isEmpty) {
+        return;
+      }
+
+      final item = picked.files.first;
+      Uint8List? bytes = item.bytes;
+      final path = item.path;
+
+      if (bytes == null && path != null && path.isNotEmpty) {
+        bytes = await File(path).readAsBytes();
+      }
+
+      if (bytes == null || bytes.isEmpty) {
+        throw Exception('Не удалось прочитать вложение');
+      }
+
+      final fileName = item.name.trim().isEmpty
+          ? 'attachment_${DateTime.now().millisecondsSinceEpoch}'
+          : item.name.trim();
+
+      final mediaType = lookupMimeType(fileName) ?? 'application/octet-stream';
+
+      await widget.onSendFileRequested!.call(
+        bytes: bytes,
+        fileName: fileName,
+        mediaType: mediaType,
+      );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Encrypted file envelope отправлен')),
+        SnackBar(content: Text('Вложение отправлено: $fileName')),
       );
     } catch (e) {
       if (!mounted) return;
@@ -480,7 +519,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                   const SizedBox(width: 8),
                   IconButton.filledTonal(
-                    onPressed: _isSendingFile ? null : _sendDemoFile,
+                    onPressed: _isSendingFile ? null : _pickAndSendFile,
                     icon: _isSendingFile
                         ? const SizedBox(
                             width: 18,

@@ -1,5 +1,4 @@
 ﻿import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -559,7 +558,12 @@ class _AppShellScreenState extends State<AppShellScreen> {
     );
   }
 
-  Future<void> _sendDemoEncryptedFile(FriendUser friend, String label) async {
+  Future<void> _sendEncryptedFileAttachment({
+    required FriendUser friend,
+    required Uint8List bytes,
+    required String fileName,
+    required String mediaType,
+  }) async {
     final profile = _profile;
     final mailbox = _mailbox;
     final transfer = _fileTransfer;
@@ -588,14 +592,10 @@ class _AppShellScreenState extends State<AppShellScreen> {
       );
     }
 
-    final bytes = Uint8List.fromList(
-      utf8.encode('mayak_demo_file:${DateTime.now().toIso8601String()}:$label'),
-    );
-
     final prepared = await transfer.prepareAndPersistUpload(
       sender: profile,
-      fileName: 'demo_${DateTime.now().millisecondsSinceEpoch}.txt',
-      mediaType: 'text/plain',
+      fileName: fileName,
+      mediaType: mediaType,
       plaintext: bytes,
       recipients: recipients,
     );
@@ -620,7 +620,17 @@ class _AppShellScreenState extends State<AppShellScreen> {
           e2ee: e2ee,
           onSyncRequested: _backgroundMailboxSync,
           onSafetyNumberRequested: () => _buildSafetyNumber(friend),
-          onSendFileRequested: (label) => _sendDemoEncryptedFile(friend, label),
+          onSendFileRequested: ({
+            required Uint8List bytes,
+            required String fileName,
+            required String mediaType,
+          }) =>
+              _sendEncryptedFileAttachment(
+                friend: friend,
+                bytes: bytes,
+                fileName: fileName,
+                mediaType: mediaType,
+              ),
         ),
       ),
     );
