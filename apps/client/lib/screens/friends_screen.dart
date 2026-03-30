@@ -12,6 +12,8 @@ class FriendsScreen extends StatelessWidget {
     required this.incomingRequests,
     required this.outgoingRequests,
     required this.onOpenChat,
+    required this.onStartVoiceCall,
+    required this.onStartVideoCall,
     required this.onAcceptRequest,
     required this.onRejectRequest,
     required this.onRefresh,
@@ -22,6 +24,8 @@ class FriendsScreen extends StatelessWidget {
   final List<FriendRequestView> incomingRequests;
   final List<FriendRequestView> outgoingRequests;
   final ValueChanged<FriendUser> onOpenChat;
+  final ValueChanged<FriendUser> onStartVoiceCall;
+  final ValueChanged<FriendUser> onStartVideoCall;
   final ValueChanged<FriendRequestView> onAcceptRequest;
   final ValueChanged<FriendRequestView> onRejectRequest;
   final Future<void> Function() onRefresh;
@@ -39,7 +43,7 @@ class FriendsScreen extends StatelessWidget {
     final hh = time.hour.toString().padLeft(2, '0');
     final mm = time.minute.toString().padLeft(2, '0');
     return 'был(а) в $hh:$mm';
-    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -297,9 +301,27 @@ class FriendsScreen extends StatelessWidget {
                             ),
                           ),
                           const SizedBox(width: 10),
-                          IconButton.filledTonal(
-                            onPressed: () => onOpenChat(friend),
-                            icon: const Icon(Icons.chat_bubble_rounded),
+                          Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton.filledTonal(
+                                onPressed: () => onOpenChat(friend),
+                                icon: const Icon(Icons.chat_bubble_rounded),
+                                tooltip: 'Чат',
+                              ),
+                              const SizedBox(height: 8),
+                              IconButton.filledTonal(
+                                onPressed: () => onStartVoiceCall(friend),
+                                icon: const Icon(Icons.call_rounded),
+                                tooltip: 'Голосовой звонок',
+                              ),
+                              const SizedBox(height: 8),
+                              IconButton.filled(
+                                onPressed: () => onStartVideoCall(friend),
+                                icon: const Icon(Icons.videocam_rounded),
+                                tooltip: 'Видеозвонок',
+                              ),
+                            ],
                           ),
                         ],
                       ),
