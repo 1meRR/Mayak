@@ -14,7 +14,7 @@ class FriendsScreen extends StatelessWidget {
     required this.onOpenChat,
     required this.onStartVoiceCall,
     required this.onStartVideoCall,
-    required this.onRemoveFriend,
+    this.onRemoveFriend,
     required this.onAcceptRequest,
     required this.onRejectRequest,
     required this.onRefresh,
@@ -27,7 +27,7 @@ class FriendsScreen extends StatelessWidget {
   final ValueChanged<FriendUser> onOpenChat;
   final ValueChanged<FriendUser> onStartVoiceCall;
   final ValueChanged<FriendUser> onStartVideoCall;
-  final ValueChanged<FriendUser> onRemoveFriend;
+  final ValueChanged<FriendUser>? onRemoveFriend;
   final ValueChanged<FriendRequestView> onAcceptRequest;
   final ValueChanged<FriendRequestView> onRejectRequest;
   final Future<void> Function() onRefresh;
@@ -323,12 +323,14 @@ class FriendsScreen extends StatelessWidget {
                                 icon: const Icon(Icons.videocam_rounded),
                                 tooltip: 'Видеозвонок',
                               ),
-                              const SizedBox(height: 8),
-                              IconButton(
-                                onPressed: () => onRemoveFriend(friend),
-                                icon: const Icon(Icons.person_remove_rounded),
-                                tooltip: 'Удалить из друзей',
-                              ),
+                              if (onRemoveFriend != null) ...[
+                                const SizedBox(height: 8),
+                                IconButton(
+                                  onPressed: () => onRemoveFriend!.call(friend),
+                                  icon: const Icon(Icons.person_remove_rounded),
+                                  tooltip: 'Удалить из друзей',
+                                ),
+                              ],
                             ],
                           ),
                         ],
