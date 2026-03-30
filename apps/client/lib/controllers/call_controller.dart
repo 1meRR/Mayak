@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart' as rtc;
+import 'package:permission_handler/permission_handler.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/app_models.dart';
@@ -85,6 +86,7 @@ class CallController extends ChangeNotifier {
       },
     );
 
+    await _ensureMediaPermissions();
     await _announceOwnDevice();
     await _openLocalMedia();
 
@@ -100,6 +102,23 @@ class CallController extends ChangeNotifier {
     }
 
     notifyListeners();
+  }
+
+  Future<void> _ensureMediaPermissions() async {
+    final cameraStatus = await Permission.camera.request();
+    final micStatus = await Permission.microphone.request();
+
+    if (cameraStatus.isPermanentlyDenied || micStatus.isPermanentlyDenied) {
+      _setConnectionText('Нет доступа к камере/микрофону. Разреши в настройках.');
+      throw Exception(
+        'Разрешения на камеру/микрофон отклонены навсегда. Открой настройки приложения.',
+      );
+    }
+
+    if (!cameraStatus.isGranted || !micStatus.isGranted) {
+      _setConnectionText('Нужны разрешения на камеру и микрофон');
+      throw Exception('Без разрешений на камеру и микрофон звонок невозможен');
+    }
   }
 
   Future<void> _announceOwnDevice() async {
