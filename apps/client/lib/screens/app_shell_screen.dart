@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../models/app_models.dart';
 import '../services/api_service.dart';
+import '../services/app_notification_service.dart';
 import '../services/device_socket_service.dart';
 import '../services/e2ee/crypto_bridge.dart';
 import '../services/e2ee/e2ee_file_service.dart';
@@ -37,6 +38,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
   final SettingsRepository _settings = SettingsRepository();
   final LocalMessageStore _messageStore = LocalMessageStore();
   final DeviceSocketService _deviceSocket = DeviceSocketService();
+  final AppNotificationService _notifications = AppNotificationService();
 
   bool _loading = true;
   bool _syncing = false;
@@ -92,6 +94,8 @@ class _AppShellScreenState extends State<AppShellScreen> {
     });
 
     try {
+      await _notifications.initialize();
+
       final profile = await _settings.ensureProfile();
       final api = ApiService(profile.serverUrl);
       final mailbox = MailboxService(profile.serverUrl);
@@ -272,6 +276,11 @@ class _AppShellScreenState extends State<AppShellScreen> {
           message: message,
         );
 
+        await _notifications.showIncomingMessage(
+          fromName: friend?.displayName ?? senderPublicId,
+          text: item.plaintext,
+        );
+
         if (maxSeq == null || item.serverSeq > maxSeq) {
           maxSeq = item.serverSeq;
         }
@@ -340,6 +349,11 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
       _presentingIncomingCall = true;
       _handledIncomingInviteIds.add(invite.id);
+
+      await _notifications.showIncomingCall(
+        fromName: friend.displayName,
+        roomId: invite.roomId,
+      );
 
       if (!mounted) {
         _presentingIncomingCall = false;

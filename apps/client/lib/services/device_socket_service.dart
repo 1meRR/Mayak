@@ -50,6 +50,7 @@ class DeviceSocketService {
       path: '/v1/ws',
       queryParameters: {
         'deviceId': profile.deviceId.trim().toUpperCase(),
+        'token': profile.sessionToken.trim(),
       },
     );
   }
@@ -91,14 +92,12 @@ class DeviceSocketService {
     final ready = Completer<void>();
     var firstEventSeen = false;
 
+    _connected = true;
+    _connectedController.add(true);
+
     _subscription = channel.stream.listen(
       (event) {
         firstEventSeen = true;
-
-        if (!_connected) {
-          _connected = true;
-          _connectedController.add(true);
-        }
 
         if (!ready.isCompleted) {
           ready.complete();
