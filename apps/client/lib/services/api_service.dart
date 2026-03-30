@@ -464,7 +464,7 @@ class ApiService {
   }) async {
     final decoded = await _request(
       'POST',
-      _uri('/api/calls/invite'),
+      _uri('/v1/calls/invite'),
       body: {
         'callerPublicId': callerPublicId.trim().toUpperCase(),
         'callerDeviceId': callerDeviceId.trim().toUpperCase(),
@@ -479,7 +479,7 @@ class ApiService {
   Future<CallInviteView> getCallInvite(String inviteId) async {
     final decoded = await _request(
       'GET',
-      _uri('/api/calls/$inviteId'),
+      _uri('/v1/calls/$inviteId'),
     );
 
     return CallInviteView.fromJson(decoded);
@@ -488,7 +488,7 @@ class ApiService {
   Future<List<CallInviteView>> fetchIncomingCalls(String publicId) async {
     final decoded = await _request(
       'GET',
-      _uri('/api/calls/incoming/${publicId.trim().toUpperCase()}'),
+      _uri('/v1/calls/incoming/${publicId.trim().toUpperCase()}'),
     );
 
     final rawItems = decoded['items'];
@@ -515,7 +515,7 @@ class ApiService {
   }) async {
     final decoded = await _request(
       'POST',
-      _uri('/api/calls/respond'),
+      _uri('/v1/calls/respond'),
       body: {
         'inviteId': inviteId,
         'actorPublicId': actorPublicId.trim().toUpperCase(),
@@ -526,6 +526,26 @@ class ApiService {
     );
 
     return CallInviteView.fromJson(decoded);
+  }
+
+  Future<bool> deleteFriend({
+    required String actorPublicId,
+    required String actorDeviceId,
+    required String sessionToken,
+    required String friendPublicId,
+  }) async {
+    final decoded = await _request(
+      'POST',
+      _uri('/v1/friends/delete'),
+      body: {
+        'actorPublicId': actorPublicId.trim().toUpperCase(),
+        'actorDeviceId': actorDeviceId.trim().toUpperCase(),
+        'sessionToken': sessionToken.trim(),
+        'friendPublicId': friendPublicId.trim().toUpperCase(),
+      },
+    );
+
+    return decoded['removed'] == true;
   }
 
   Future<Map<String, dynamic>> ensurePlaceholderMailboxKeyPackage({

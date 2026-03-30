@@ -143,7 +143,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _sendDemoFile() async {
+  Future<void> _sendAttachment() async {
     if (_isSendingFile || widget.onSendFileRequested == null) {
       return;
     }
@@ -153,7 +153,7 @@ class _ChatScreenState extends State<ChatScreen> {
       await widget.onSendFileRequested!.call(_textController.text.trim());
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Encrypted file envelope отправлен')),
+        const SnackBar(content: Text('Вложение зашифровано и отправлено')),
       );
     } catch (e) {
       if (!mounted) return;
@@ -480,7 +480,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                   const SizedBox(width: 8),
                   IconButton.filledTonal(
-                    onPressed: _isSendingFile ? null : _sendDemoFile,
+                    onPressed: _isSendingFile ? null : _sendAttachment,
                     icon: _isSendingFile
                         ? const SizedBox(
                             width: 18,

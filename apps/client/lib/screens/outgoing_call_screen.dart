@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../models/app_models.dart';
 import '../services/api_service.dart';
@@ -46,6 +47,11 @@ class _OutgoingCallScreenState extends State<OutgoingCallScreen> {
 
   Future<void> _bootstrap() async {
     try {
+      final permissionsReady = await _ensureCallPermissions();
+      if (!permissionsReady) {
+        throw Exception('Нет доступа к камере или микрофону');
+      }
+
       final invite = await widget.api.createCallInvite(
         callerPublicId: widget.profile.publicId,
         callerDeviceId: widget.profile.deviceId,
@@ -76,6 +82,12 @@ class _OutgoingCallScreenState extends State<OutgoingCallScreen> {
         _error = error.toString();
       });
     }
+  }
+
+  Future<bool> _ensureCallPermissions() async {
+    final micStatus = await Permission.microphone.request();
+    final cameraStatus = await Permission.camera.request();
+    return micStatus.isGranted && cameraStatus.isGranted;
   }
 
   Future<void> _pollInviteState() async {

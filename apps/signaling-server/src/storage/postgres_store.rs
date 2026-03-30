@@ -1,7 +1,8 @@
 use crate::domain::models::{
-    AckEnvelopeResponse, CreateFileObjectRequest, DeviceDirectoryView, DeviceKeyPackageView,
-    FileKeyEnvelopeView, FileLookupResponse, FileObjectView, FriendRequestView, FriendUserView,
-    FriendsBundleView, LoginResponse, RecipientEnvelopeInput, RegisterRequest, StoredEnvelopeView,
+    AckEnvelopeResponse, CallInviteView, CreateCallInviteRequest, CreateFileObjectRequest,
+    DeviceDirectoryView, DeviceKeyPackageView, FileKeyEnvelopeView, FileLookupResponse,
+    FileObjectView, FriendRequestView, FriendUserView, FriendsBundleView, LoginResponse,
+    RecipientEnvelopeInput, RegisterRequest, RespondCallInviteRequest, StoredEnvelopeView,
     UpsertDeviceKeyPackageRequest, UserProfileView,
 };
 use argon2::{
@@ -304,7 +305,10 @@ impl PostgresStore {
             .collect())
     }
 
-    pub async fn lookup_user_by_public_id(&self, public_id: &str) -> Result<FriendUserView, String> {
+    pub async fn lookup_user_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<FriendUserView, String> {
         self.lookup_user("u.public_id = $1", public_id.trim().to_uppercase())
             .await
     }
@@ -484,7 +488,11 @@ impl PostgresStore {
             return Err("Только получатель заявки может её обработать".to_string());
         }
 
-        let next_status = if action == "accept" { "accepted" } else { "rejected" };
+        let next_status = if action == "accept" {
+            "accepted"
+        } else {
+            "rejected"
+        };
 
         sqlx::query(
             r#"
@@ -582,12 +590,18 @@ impl PostgresStore {
 
         let mut incoming_requests = Vec::with_capacity(incoming_rows.len());
         for row in incoming_rows {
-            incoming_requests.push(self.fetch_friend_request_view(row.get("request_id")).await?);
+            incoming_requests.push(
+                self.fetch_friend_request_view(row.get("request_id"))
+                    .await?,
+            );
         }
 
         let mut outgoing_requests = Vec::with_capacity(outgoing_rows.len());
         for row in outgoing_rows {
-            outgoing_requests.push(self.fetch_friend_request_view(row.get("request_id")).await?);
+            outgoing_requests.push(
+                self.fetch_friend_request_view(row.get("request_id"))
+                    .await?,
+            );
         }
 
         let friends = friends_rows
@@ -619,6 +633,222 @@ impl PostgresStore {
         })
     }
 
+    pub async fn delete_friend(
+        &self,
+        actor_public_id: &str,
+        actor_device_id: &str,
+        session_token: &str,
+        friend_public_id: &str,
+    ) -> Result<bool, String> {
+        let actor_public_id = actor_public_id.trim().to_uppercase();
+        let actor_device_id = normalize_device_id(actor_device_id);
+        let friend_public_id = friend_public_id.trim().to_uppercase();
+        self.validate_session(&actor_public_id, &actor_device_id, session_token)
+            .await?;
+
+        if actor_public_id == friend_public_id {
+            return Err("Нельзя удалить себя из друзей".to_string());
+        }
+
+        let actor_user = self.fetch_user_meta_by_public_id(&actor_public_id).await?;
+        let friend_user = self.fetch_user_meta_by_public_id(&friend_public_id).await?;
+
+        let removed = sqlx::query(
+            r#"
+            DELETE FROM friendships
+            WHERE user_low_id = LEAST($1, $2)
+              AND user_high_id = GREATEST($1, $2)
+            "#,
+        )
+        .bind(actor_user.0)
+        .bind(friend_user.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(removed.rows_affected() > 0)
+    }
+
+    pub async fn create_call_invite(
+        &self,
+        req: CreateCallInviteRequest,
+    ) -> Result<CallInviteView, String> {
+        let caller_public_id = req.caller_public_id.trim().to_uppercase();
+        let caller_device_id = normalize_device_id(&req.caller_device_id);
+        let callee_public_id = req.callee_public_id.trim().to_uppercase();
+
+        self.validate_session(&caller_public_id, &caller_device_id, &req.session_token)
+            .await?;
+
+        if caller_public_id == callee_public_id {
+            return Err("Нельзя звонить самому себе".to_string());
+        }
+
+        let caller = self.fetch_user_meta_by_public_id(&caller_public_id).await?;
+        let callee = self.fetch_user_meta_by_public_id(&callee_public_id).await?;
+
+        let invite_id = format!("CALL{}", random_upper_alnum(14));
+        let room_id = format!("ROOM{}", random_upper_alnum(16));
+
+        sqlx::query(
+            r#"
+            INSERT INTO call_invites (
+                invite_id, caller_user_id, callee_user_id, room_id, status, created_at
+            )
+            VALUES ($1, $2, $3, $4, 'pending', now())
+            "#,
+        )
+        .bind(&invite_id)
+        .bind(caller.0)
+        .bind(callee.0)
+        .bind(&room_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        self.fetch_call_invite(&invite_id).await
+    }
+
+    pub async fn fetch_call_invite(&self, invite_id: &str) -> Result<CallInviteView, String> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                ci.invite_id AS invite_id,
+                cu.public_id AS caller_public_id,
+                cu.first_name AS caller_first_name,
+                cu.last_name AS caller_last_name,
+                tu.public_id AS callee_public_id,
+                tu.first_name AS callee_first_name,
+                tu.last_name AS callee_last_name,
+                ci.room_id AS room_id,
+                ci.status AS status,
+                (EXTRACT(EPOCH FROM ci.created_at) * 1000)::BIGINT AS created_at_ms,
+                (EXTRACT(EPOCH FROM ci.responded_at) * 1000)::BIGINT AS responded_at_ms
+            FROM call_invites ci
+            INNER JOIN users cu ON cu.id = ci.caller_user_id
+            INNER JOIN users tu ON tu.id = ci.callee_user_id
+            WHERE ci.invite_id = $1
+            "#,
+        )
+        .bind(invite_id.trim())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Invite не найден".to_string())?;
+
+        let caller_first_name: String = row.get("caller_first_name");
+        let caller_last_name: String = row.get("caller_last_name");
+        let callee_first_name: String = row.get("callee_first_name");
+        let callee_last_name: String = row.get("callee_last_name");
+
+        Ok(CallInviteView {
+            invite_id: row.get("invite_id"),
+            caller_public_id: row.get("caller_public_id"),
+            caller_display_name: build_display_name(&caller_first_name, &caller_last_name),
+            callee_public_id: row.get("callee_public_id"),
+            callee_display_name: build_display_name(&callee_first_name, &callee_last_name),
+            room_id: row.get("room_id"),
+            status: row.get("status"),
+            created_at: row.get("created_at_ms"),
+            responded_at: row.try_get("responded_at_ms").ok(),
+        })
+    }
+
+    pub async fn list_incoming_call_invites(
+        &self,
+        callee_public_id: &str,
+    ) -> Result<Vec<CallInviteView>, String> {
+        let rows = sqlx::query(
+            r#"
+            SELECT invite_id
+            FROM call_invites ci
+            INNER JOIN users u ON u.id = ci.callee_user_id
+            WHERE u.public_id = $1
+              AND ci.status = 'pending'
+            ORDER BY ci.created_at DESC
+            LIMIT 20
+            "#,
+        )
+        .bind(callee_public_id.trim().to_uppercase())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let invite_id: String = row.get("invite_id");
+            items.push(self.fetch_call_invite(&invite_id).await?);
+        }
+        Ok(items)
+    }
+
+    pub async fn respond_call_invite(
+        &self,
+        req: RespondCallInviteRequest,
+    ) -> Result<CallInviteView, String> {
+        let actor_public_id = req.actor_public_id.trim().to_uppercase();
+        let actor_device_id = normalize_device_id(&req.actor_device_id);
+        self.validate_session(&actor_public_id, &actor_device_id, &req.session_token)
+            .await?;
+
+        let invite_row = sqlx::query(
+            r#"
+            SELECT
+                ci.caller_user_id AS caller_user_id,
+                ci.callee_user_id AS callee_user_id,
+                ci.status AS status
+            FROM call_invites ci
+            WHERE ci.invite_id = $1
+            "#,
+        )
+        .bind(req.invite_id.trim())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Invite не найден".to_string())?;
+
+        let actor_row = sqlx::query("SELECT id FROM users WHERE public_id = $1")
+            .bind(&actor_public_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Пользователь не найден".to_string())?;
+        let actor_id: Uuid = actor_row.get("id");
+
+        let caller_user_id: Uuid = invite_row.get("caller_user_id");
+        let callee_user_id: Uuid = invite_row.get("callee_user_id");
+        let status: String = invite_row.get("status");
+        if status != "pending" {
+            return Err("Invite уже обработан".to_string());
+        }
+
+        if actor_id != callee_user_id && actor_id != caller_user_id {
+            return Err("Нет доступа к invite".to_string());
+        }
+
+        let action = req.action.trim().to_lowercase();
+        let next_status = match action.as_str() {
+            "accept" => "accepted",
+            "reject" => "rejected",
+            _ => return Err("action должен быть accept или reject".to_string()),
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE call_invites
+            SET status = $1, responded_at = now()
+            WHERE invite_id = $2
+            "#,
+        )
+        .bind(next_status)
+        .bind(req.invite_id.trim())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        self.fetch_call_invite(req.invite_id.trim()).await
+    }
+
     async fn validate_session(
         &self,
         public_id: &str,
@@ -647,7 +877,10 @@ impl PostgresStore {
         Ok(())
     }
 
-    async fn fetch_user_meta_by_public_id(&self, public_id: &str) -> Result<(Uuid, String), String> {
+    async fn fetch_user_meta_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<(Uuid, String), String> {
         let row = sqlx::query(
             r#"
             SELECT id, first_name, last_name
@@ -666,7 +899,10 @@ impl PostgresStore {
         Ok((row.get("id"), build_display_name(&first_name, &last_name)))
     }
 
-    async fn fetch_friend_request_view(&self, request_id: &str) -> Result<FriendRequestView, String> {
+    async fn fetch_friend_request_view(
+        &self,
+        request_id: &str,
+    ) -> Result<FriendRequestView, String> {
         let row = sqlx::query(
             r#"
             SELECT
