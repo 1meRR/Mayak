@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../models/app_models.dart';
 import '../services/api_service.dart';
@@ -40,6 +41,11 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
     });
 
     try {
+      final permissionsReady = await _ensureCallPermissions();
+      if (!permissionsReady) {
+        throw Exception('Нет доступа к камере или микрофону');
+      }
+
       final invite = await widget.api.respondCallInvite(
         inviteId: widget.invite.inviteId,
         actorPublicId: widget.profile.publicId,
@@ -74,6 +80,12 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
         _error = error.toString();
       });
     }
+  }
+
+  Future<bool> _ensureCallPermissions() async {
+    final micStatus = await Permission.microphone.request();
+    final cameraStatus = await Permission.camera.request();
+    return micStatus.isGranted && cameraStatus.isGranted;
   }
 
   Future<void> _reject() async {
