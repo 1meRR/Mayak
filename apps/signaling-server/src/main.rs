@@ -14,10 +14,11 @@ use axum::{
 };
 use domain::models::{
     AckEnvelopeRequest, ClaimPrekeyRequest, CompleteFileObjectRequest, CreateFileObjectRequest,
-    CreateFriendRequestRequest, ErrorResponse, LoginRequest, PendingMessagesQuery,
-    PendingMessagesResponse, RegisterRequest, RespondFriendRequestRequest,
+    CreateCallInviteRequest, CreateFriendRequestRequest, ErrorResponse, IncomingCallsResponse,
+    LoginRequest, PendingMessagesQuery, PendingMessagesResponse, RegisterRequest,
+    RemoveFriendRequest, RespondCallInviteRequest, RespondFriendRequestRequest,
     SendEncryptedMessageRequest, SendEncryptedMessageResponse, UpsertDeviceKeyPackageRequest,
-    UserLookupResponse,
+    UserLookupResponse, CallInviteView,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde_json::json;
@@ -34,6 +35,7 @@ type Tx = mpsc::UnboundedSender<Message>;
 struct AppState {
     store: PostgresStore,
     online_devices: Arc<RwLock<HashMap<String, Tx>>>,
+    call_invites: Arc<RwLock<HashMap<String, CallInviteView>>>,
 }
 
 #[tokio::main]
@@ -54,6 +56,7 @@ async fn main() {
     let state = AppState {
         store: PostgresStore::new(pool),
         online_devices: Arc::new(RwLock::new(HashMap::new())),
+        call_invites: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -69,6 +72,11 @@ async fn main() {
         .route("/v1/friends/{public_id}", get(fetch_friends_bundle))
         .route("/v1/friends/request", post(create_friend_request))
         .route("/v1/friends/respond", post(respond_friend_request))
+        .route("/v1/friends/remove", post(remove_friend))
+        .route("/api/calls/invite", post(create_call_invite))
+        .route("/api/calls/{invite_id}", get(get_call_invite))
+        .route("/api/calls/incoming/{public_id}", get(fetch_incoming_calls))
+        .route("/api/calls/respond", post(respond_call_invite))
         .route("/v1/prekeys/claim", post(claim_prekey))
         .route("/v1/devices/key-package", post(upsert_device_key_package))
         .route("/v1/messages/send", post(send_encrypted_messages))
@@ -211,6 +219,156 @@ async fn respond_friend_request(
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
         Err(err) => error_response(StatusCode::BAD_REQUEST, err),
     }
+}
+
+async fn remove_friend(
+    State(state): State<AppState>,
+    Json(req): Json<RemoveFriendRequest>,
+) -> Response {
+    match state
+        .store
+        .remove_friend(
+            &req.actor_public_id,
+            &req.actor_device_id,
+            &req.session_token,
+            &req.target_public_id,
+        )
+        .await
+    {
+        Ok(_) => (StatusCode::OK, Json(json!({ "removed": true }))).into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn create_call_invite(
+    State(state): State<AppState>,
+    Json(req): Json<CreateCallInviteRequest>,
+) -> Response {
+    let auth = match state
+        .store
+        .authenticate(&req.session_token, &req.caller_device_id)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => return error_response(StatusCode::UNAUTHORIZED, err),
+    };
+
+    let caller_public_id = req.caller_public_id.trim().to_uppercase();
+    let callee_public_id = req.callee_public_id.trim().to_uppercase();
+    if auth.public_id != caller_public_id {
+        return error_response(StatusCode::UNAUTHORIZED, "Неверный callerPublicId");
+    }
+    if caller_public_id == callee_public_id {
+        return error_response(StatusCode::BAD_REQUEST, "Нельзя звонить самому себе");
+    }
+
+    let caller = match state.store.lookup_user_by_public_id(&caller_public_id).await {
+        Ok(v) => v,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let callee = match state.store.lookup_user_by_public_id(&callee_public_id).await {
+        Ok(v) => v,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let invite = CallInviteView {
+        invite_id: format!("CI{}", uuid::Uuid::new_v4().simple()),
+        caller_public_id: caller_public_id.clone(),
+        caller_display_name: caller.display_name,
+        callee_public_id: callee_public_id.clone(),
+        callee_display_name: callee.display_name,
+        room_id: format!("room_{}_{}_{}", caller_public_id, callee_public_id, now),
+        status: "pending".to_string(),
+        created_at: now,
+        responded_at: None,
+    };
+
+    let mut invites = state.call_invites.write().await;
+    invites.insert(invite.invite_id.clone(), invite.clone());
+    (StatusCode::OK, Json(invite)).into_response()
+}
+
+async fn get_call_invite(
+    State(state): State<AppState>,
+    Path(invite_id): Path<String>,
+) -> Response {
+    let invites = state.call_invites.read().await;
+    match invites.get(invite_id.trim()) {
+        Some(invite) => (StatusCode::OK, Json(invite.clone())).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "Invite не найден"),
+    }
+}
+
+async fn fetch_incoming_calls(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+) -> Response {
+    let normalized = public_id.trim().to_uppercase();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut invites = state.call_invites.write().await;
+    for invite in invites.values_mut() {
+        if invite.status == "pending" && now - invite.created_at > 120_000 {
+            invite.status = "expired".to_string();
+            invite.responded_at = Some(now);
+        }
+    }
+
+    let items = invites
+        .values()
+        .filter(|invite| invite.callee_public_id == normalized && invite.status == "pending")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    (StatusCode::OK, Json(IncomingCallsResponse { items })).into_response()
+}
+
+async fn respond_call_invite(
+    State(state): State<AppState>,
+    Json(req): Json<RespondCallInviteRequest>,
+) -> Response {
+    let auth = match state
+        .store
+        .authenticate(&req.session_token, &req.actor_device_id)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => return error_response(StatusCode::UNAUTHORIZED, err),
+    };
+
+    let action = req.action.trim().to_lowercase();
+    if action != "accept" && action != "reject" {
+        return error_response(StatusCode::BAD_REQUEST, "action должен быть accept/reject");
+    }
+
+    let actor_public_id = req.actor_public_id.trim().to_uppercase();
+    if auth.public_id != actor_public_id {
+        return error_response(StatusCode::UNAUTHORIZED, "Неверный actorPublicId");
+    }
+
+    let mut invites = state.call_invites.write().await;
+    let invite = match invites.get_mut(req.invite_id.trim()) {
+        Some(v) => v,
+        None => return error_response(StatusCode::NOT_FOUND, "Invite не найден"),
+    };
+
+    if invite.status != "pending" {
+        return (StatusCode::OK, Json(invite.clone())).into_response();
+    }
+
+    if invite.callee_public_id != actor_public_id {
+        return error_response(StatusCode::FORBIDDEN, "Только вызываемый может ответить");
+    }
+
+    invite.status = if action == "accept" {
+        "accepted".to_string()
+    } else {
+        "rejected".to_string()
+    };
+    invite.responded_at = Some(chrono::Utc::now().timestamp_millis());
+
+    (StatusCode::OK, Json(invite.clone())).into_response()
 }
 
 async fn claim_prekey(

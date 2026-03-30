@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../models/app_models.dart';
 import '../services/api_service.dart';
+import '../services/app_notification_service.dart';
 import '../services/device_socket_service.dart';
 import '../services/e2ee/crypto_bridge.dart';
 import '../services/e2ee/e2ee_file_service.dart';
@@ -23,6 +24,7 @@ import 'chat_screen.dart';
 import 'friends_screen.dart';
 import 'incoming_call_screen.dart';
 import 'onboarding_screen.dart';
+import 'outgoing_call_screen.dart';
 import 'profile_screen.dart';
 
 class AppShellScreen extends StatefulWidget {
@@ -36,6 +38,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
   final SettingsRepository _settings = SettingsRepository();
   final LocalMessageStore _messageStore = LocalMessageStore();
   final DeviceSocketService _deviceSocket = DeviceSocketService();
+  final AppNotificationService _notifications = AppNotificationService();
 
   bool _loading = true;
   bool _syncing = false;
@@ -91,6 +94,8 @@ class _AppShellScreenState extends State<AppShellScreen> {
     });
 
     try {
+      await _notifications.initialize();
+
       final profile = await _settings.ensureProfile();
       final api = ApiService(profile.serverUrl);
       final mailbox = MailboxService(profile.serverUrl);
@@ -271,6 +276,11 @@ class _AppShellScreenState extends State<AppShellScreen> {
           message: message,
         );
 
+        await _notifications.showIncomingMessage(
+          fromName: friend?.displayName ?? senderPublicId,
+          text: item.plaintext,
+        );
+
         if (maxSeq == null || item.serverSeq > maxSeq) {
           maxSeq = item.serverSeq;
         }
@@ -339,6 +349,11 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
       _presentingIncomingCall = true;
       _handledIncomingInviteIds.add(invite.id);
+
+      await _notifications.showIncomingCall(
+        fromName: friend.displayName,
+        roomId: invite.roomId,
+      );
 
       if (!mounted) {
         _presentingIncomingCall = false;
@@ -613,6 +628,66 @@ class _AppShellScreenState extends State<AppShellScreen> {
     await _backgroundSync(force: true);
   }
 
+  Future<void> _openOutgoingCall(FriendUser friend) async {
+    final profile = _profile;
+    final api = _api;
+    if (profile == null || api == null) return;
+
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => OutgoingCallScreen(
+          profile: profile,
+          friend: friend,
+          api: api,
+          socket: _deviceSocket,
+        ),
+      ),
+    );
+
+    await _backgroundSync(force: true);
+  }
+
+  Future<void> _removeFriend(FriendUser friend) async {
+    final profile = _profile;
+    final api = _api;
+    if (profile == null || api == null) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Удалить из друзей?'),
+        content: Text('Пользователь ${friend.displayName} будет удалён из списка друзей.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    try {
+      await api.removeFriend(
+        actorPublicId: profile.publicId,
+        actorDeviceId: profile.deviceId,
+        sessionToken: profile.sessionToken,
+        targetPublicId: friend.publicId,
+      );
+      await _backgroundSync(force: true);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Не удалось удалить друга: $e')),
+      );
+    }
+  }
+
   Widget _buildBody() {
     if (_loading) {
       return const Center(child: CircularProgressIndicator());
@@ -663,6 +738,9 @@ class _AppShellScreenState extends State<AppShellScreen> {
           incomingRequests: bundle.incomingRequests,
           outgoingRequests: bundle.outgoingRequests,
           onOpenChat: _openChat,
+          onStartVoiceCall: _openOutgoingCall,
+          onStartVideoCall: _openOutgoingCall,
+          onRemoveFriend: _removeFriend,
           onAcceptRequest: _acceptRequest,
           onRejectRequest: _rejectRequest,
           onRefresh: () => _backgroundSync(force: true),
@@ -685,6 +763,9 @@ class _AppShellScreenState extends State<AppShellScreen> {
           incomingRequests: bundle.incomingRequests,
           outgoingRequests: bundle.outgoingRequests,
           onOpenChat: _openChat,
+          onStartVoiceCall: _openOutgoingCall,
+          onStartVideoCall: _openOutgoingCall,
+          onRemoveFriend: _removeFriend,
           onAcceptRequest: _acceptRequest,
           onRejectRequest: _rejectRequest,
           onRefresh: () => _backgroundSync(force: true),

@@ -293,3 +293,51 @@ pub struct RespondFriendRequestRequest {
     pub session_token: String,
     pub action: String,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveFriendRequest {
+    pub actor_public_id: String,
+    pub actor_device_id: String,
+    pub session_token: String,
+    pub target_public_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallInviteView {
+    pub invite_id: String,
+    pub caller_public_id: String,
+    pub caller_display_name: String,
+    pub callee_public_id: String,
+    pub callee_display_name: String,
+    pub room_id: String,
+    pub status: String,
+    pub created_at: i64,
+    pub responded_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCallInviteRequest {
+    pub caller_public_id: String,
+    pub caller_device_id: String,
+    pub session_token: String,
+    pub callee_public_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RespondCallInviteRequest {
+    pub invite_id: String,
+    pub actor_public_id: String,
+    pub actor_device_id: String,
+    pub session_token: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingCallsResponse {
+    pub items: Vec<CallInviteView>,
+}

@@ -456,6 +456,24 @@ class ApiService {
     return FriendRequestView.fromJson(decoded);
   }
 
+  Future<void> removeFriend({
+    required String actorPublicId,
+    required String actorDeviceId,
+    required String sessionToken,
+    required String targetPublicId,
+  }) async {
+    await _request(
+      'POST',
+      _uri('/v1/friends/remove'),
+      body: {
+        'actorPublicId': actorPublicId.trim().toUpperCase(),
+        'actorDeviceId': actorDeviceId.trim().toUpperCase(),
+        'sessionToken': sessionToken.trim(),
+        'targetPublicId': targetPublicId.trim().toUpperCase(),
+      },
+    );
+  }
+
   Future<CallInviteView> createCallInvite({
     required String callerPublicId,
     required String callerDeviceId,

@@ -619,6 +619,77 @@ impl PostgresStore {
         })
     }
 
+    pub async fn remove_friend(
+        &self,
+        actor_public_id: &str,
+        actor_device_id: &str,
+        session_token: &str,
+        target_public_id: &str,
+    ) -> Result<(), String> {
+        let actor_public_id = actor_public_id.trim().to_uppercase();
+        let actor_device_id = normalize_device_id(actor_device_id);
+        let target_public_id = target_public_id.trim().to_uppercase();
+
+        self.validate_session(&actor_public_id, &actor_device_id, session_token)
+            .await?;
+
+        if actor_public_id == target_public_id {
+            return Err("Нельзя удалить самого себя из друзей".to_string());
+        }
+
+        let actor_row = sqlx::query("SELECT id FROM users WHERE public_id = $1")
+            .bind(&actor_public_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Пользователь не найден".to_string())?;
+        let actor_id: Uuid = actor_row.get("id");
+
+        let target_row = sqlx::query("SELECT id FROM users WHERE public_id = $1")
+            .bind(&target_public_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Друг не найден".to_string())?;
+        let target_id: Uuid = target_row.get("id");
+
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM friendships
+            WHERE user_low_id = LEAST($1, $2)
+              AND user_high_id = GREATEST($1, $2)
+            "#,
+        )
+        .bind(actor_id)
+        .bind(target_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            r#"
+            UPDATE friend_requests
+            SET status = 'canceled', responded_at = now()
+            WHERE status = 'pending'
+              AND (
+                    (from_user_id = $1 AND to_user_id = $2)
+                 OR (from_user_id = $2 AND to_user_id = $1)
+              )
+            "#,
+        )
+        .bind(actor_id)
+        .bind(target_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if deleted.rows_affected() == 0 {
+            return Err("Пользователь не найден в списке друзей".to_string());
+        }
+
+        Ok(())
+    }
+
     async fn validate_session(
         &self,
         public_id: &str,
