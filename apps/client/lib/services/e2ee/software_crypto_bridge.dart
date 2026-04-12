@@ -11,9 +11,12 @@ import 'mailbox_models.dart';
 import 'secure_device_storage.dart';
 
 /// Software E2EE bridge:
-/// - X3DH-like async bootstrap over X25519 prekey bundles
-/// - Double-Ratchet style DH + symmetric ratchet evolution
-/// - AES-GCM authenticated encryption
+/// - X3DH async bootstrap over X25519 prekey bundles
+/// - Double-Ratchet DH + symmetric ratchet evolution
+/// - AES-GCM-256 authenticated encryption
+/// - Ed25519 signed prekey verification (ПАТЧ P-3)
+/// - OTK refill (ПАТЧ P-9)
+/// - Signed prekey rotation (ПАТЧ P-8)
 class SoftwareCryptoBridge implements CryptoBridge {
   SoftwareCryptoBridge({SecureDeviceStorage? secureStorage})
       : _secureStorage = secureStorage ?? SecureDeviceStorage();
@@ -23,7 +26,15 @@ class SoftwareCryptoBridge implements CryptoBridge {
   static const _identityKeyName = 'sw_crypto_identity_v3';
   static const _sessionsKeyName = 'sw_crypto_sessions_v3';
   static const _keyAlgorithm = 'x25519+ed25519';
-  static const _maxSkippedMessageKeys = 256;
+  static const _maxSkippedMessageKeys = 1000;
+
+  // OTK pool management
+  static const _otkInitialCount = 64;
+  static const _otkRefillThreshold = 10;
+  static const _otkRefillBatchSize = 50;
+
+  // Signed prekey rotation: раз в 7 дней
+  static const _signedPrekeyRotationMs = 7 * 24 * 60 * 60 * 1000;
 
   final X25519 _x25519 = X25519();
   final Ed25519 _ed25519 = Ed25519();
@@ -31,6 +42,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
   final Hkdf _hkdf64 = Hkdf(hmac: Hmac.sha256(), outputLength: 64);
   final Hmac _hmac = Hmac.sha256();
   final AesGcm _aead = AesGcm.with256bits();
+
+  // ─── CryptoBridge interface ──────────────────────────────────────────────
 
   @override
   Future<CryptoBridgeStatus> getStatus() async {
@@ -46,11 +59,17 @@ class SoftwareCryptoBridge implements CryptoBridge {
     UserProfile profile,
   ) async {
     final ref = _normalizeProfile(profile);
-    final existing = await _loadIdentityState(ref);
+    var existing = await _loadIdentityState(ref);
     if (existing != null) {
+      // Проверяем, нужна ли ротация signed prekey
+      final age = DateTime.now().millisecondsSinceEpoch - existing.updatedAt;
+      if (age > _signedPrekeyRotationMs) {
+        existing = await _rotateSignedPrekey(ref, existing);
+      }
       return _toKeyPackage(existing);
     }
 
+    // Создаём новую идентичность
     final identity = await _x25519.newKeyPair();
     final identityPub = await identity.extractPublicKey();
 
@@ -65,19 +84,7 @@ class SoftwareCryptoBridge implements CryptoBridge {
       keyPair: signing,
     );
 
-    final oneTime = <_OneTimePrivatePrekey>[];
-    for (var i = 0; i < 64; i++) {
-      final kp = await _x25519.newKeyPair();
-      final pub = await kp.extractPublicKey();
-      oneTime.add(
-        _OneTimePrivatePrekey(
-          id: 'otk_${i + 1}_${_randomToken(8)}',
-          publicKeyB64: _b64(pub.bytes),
-          privateKeyB64: _b64(await kp.extractPrivateKeyBytes()),
-          consumedAt: null,
-        ),
-      );
-    }
+    final oneTime = await _generateOtkBatch(_otkInitialCount);
 
     final state = _LocalIdentityState(
       deviceId: ref.deviceId,
@@ -121,6 +128,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
       _OutboundInit? init;
 
       if (session == null) {
+        // ПАТЧ P-3: верификация подписи signed prekey перед созданием сессии
+        await _verifySignedPrekeyBundle(bundle);
         init = await _createOutboundSession(localState, bundle);
         session = init.session;
       }
@@ -130,8 +139,7 @@ class SoftwareCryptoBridge implements CryptoBridge {
       }
 
       final messageKey = await _deriveMessageKey(_b64d(session.sendChainKeyB64));
-      final nextSendChain =
-          await _deriveNextChainKey(_b64d(session.sendChainKeyB64));
+      final nextSendChain = await _deriveNextChainKey(_b64d(session.sendChainKeyB64));
 
       final messageNo = session.sendChainMessageNo + 1;
       final header = <String, dynamic>{
@@ -254,7 +262,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
       );
     }
 
-    final incomingN = (header['n'] as num?)?.toInt() ?? (session.recvChainMessageNo + 1);
+    final incomingN =
+        (header['n'] as num?)?.toInt() ?? (session.recvChainMessageNo + 1);
     final skippedId = _skippedKeyId(session.remoteRatchetPublicKeyB64, incomingN);
 
     Uint8List messageKey;
@@ -318,10 +327,74 @@ class SoftwareCryptoBridge implements CryptoBridge {
     );
   }
 
+  // ─── OTK refill (ПАТЧ P-9) ───────────────────────────────────────────────
+
+  /// Возвращает true, если пул OTK нужно пополнить
+  Future<bool> needsOtkRefill(UserProfile profile) async {
+    final ref = _normalizeProfile(profile);
+    final state = await _loadIdentityState(ref);
+    if (state == null) return false;
+    final available =
+        state.oneTimePrekeys.where((k) => k.consumedAt == null).length;
+    return available < _otkRefillThreshold;
+  }
+
+  /// Генерирует новую порцию OTK и сохраняет их локально.
+  /// Возвращает только публичные части (для загрузки на сервер).
+  Future<List<String>> generateAndSaveOtkBatch(UserProfile profile) async {
+    final ref = _normalizeProfile(profile);
+    var state = await _requireIdentityState(ref);
+
+    final newOtks = await _generateOtkBatch(_otkRefillBatchSize);
+
+    // Добавляем к существующим (потреблённые оставляем для расшифровки in-flight)
+    state = _LocalIdentityState(
+      deviceId: state.deviceId,
+      identityPublicKeyB64: state.identityPublicKeyB64,
+      identityPrivateKeyB64: state.identityPrivateKeyB64,
+      signingPublicKeyB64: state.signingPublicKeyB64,
+      signingPrivateKeyB64: state.signingPrivateKeyB64,
+      signedPrekeyPublicKeyB64: state.signedPrekeyPublicKeyB64,
+      signedPrekeyPrivateKeyB64: state.signedPrekeyPrivateKeyB64,
+      signedPrekeySignatureB64: state.signedPrekeySignatureB64,
+      signedPrekeyKeyId: state.signedPrekeyKeyId,
+      oneTimePrekeys: [...state.oneTimePrekeys, ...newOtks],
+      updatedAt: state.updatedAt, // не обновляем updatedAt чтобы не тригерить rotation
+    );
+
+    await _saveIdentityState(ref, state);
+
+    // Возвращаем строки в формате "id:publicKeyB64" для сервера
+    return newOtks.map((k) => '${k.id}:${k.publicKeyB64}').toList();
+  }
+
+  // ─── Signed prekey rotation (ПАТЧ P-8) ───────────────────────────────────
+
+  /// Возвращает новый KeyPackage после ротации signed prekey.
+  /// Вызывается автоматически в ensureLocalDeviceIdentity если прошло > 7 дней.
+  Future<CryptoDeviceKeyPackage> rotateSignedPrekeyIfNeeded(
+    UserProfile profile,
+  ) async {
+    final ref = _normalizeProfile(profile);
+    final state = await _requireIdentityState(ref);
+    final age = DateTime.now().millisecondsSinceEpoch - state.updatedAt;
+    if (age > _signedPrekeyRotationMs) {
+      final rotated = await _rotateSignedPrekey(ref, state);
+      return _toKeyPackage(rotated);
+    }
+    return _toKeyPackage(state);
+  }
+
+  // ─── X3DH session bootstrap ──────────────────────────────────────────────
+
   Future<_OutboundInit> _createOutboundSession(
     _LocalIdentityState local,
     CryptoRemotePrekeyBundle bundle,
   ) async {
+    // Верификация уже сделана в encryptTextMessage перед вызовом этого метода,
+    // но добавляем защитный вызов и здесь на случай прямого вызова
+    await _verifySignedPrekeyBundle(bundle);
+
     final localIdentity =
         _x25519KeyPair(local.identityPrivateKeyB64, local.identityPublicKeyB64);
 
@@ -339,7 +412,10 @@ class SoftwareCryptoBridge implements CryptoBridge {
     String? usedOneTimeRef;
     final claimedOtk = _parseClaimedOneTimePublic(bundle.claimedOneTimePrekeyB64);
     if (claimedOtk != null) {
-      dh4 = await _shared(handshakeEphemeral, _x25519Public(claimedOtk.publicKeyB64));
+      dh4 = await _shared(
+        handshakeEphemeral,
+        _x25519Public(claimedOtk.publicKeyB64),
+      );
       usedOneTimeRef = claimedOtk.id;
     }
 
@@ -357,7 +433,10 @@ class SoftwareCryptoBridge implements CryptoBridge {
     final recvInit = await _kdfRootChain(
       rootKey: first.newRootKey,
       dhOut: await _shared(
-        _x25519KeyPair(local.signedPrekeyPrivateKeyB64, local.signedPrekeyPublicKeyB64),
+        _x25519KeyPair(
+          local.signedPrekeyPrivateKeyB64,
+          local.signedPrekeyPublicKeyB64,
+        ),
         sendRatchetPub,
       ),
       label: 'bootstrap_recv',
@@ -397,10 +476,12 @@ class SoftwareCryptoBridge implements CryptoBridge {
     final remotePublicId = header['senderPublicId']?.toString() ?? '';
     final remoteDeviceId = header['senderDeviceId']?.toString() ?? '';
 
-    final senderIdentity = _x25519Public(header['senderIdentityKeyB64']?.toString() ?? '');
+    final senderIdentity =
+        _x25519Public(header['senderIdentityKeyB64']?.toString() ?? '');
     final senderHandshakeEphemeral =
         _x25519Public(header['senderHandshakeEphemeralB64']?.toString() ?? '');
-    final senderRatchetPubB64 = header['senderRatchetKeyB64']?.toString() ?? '';
+    final senderRatchetPubB64 =
+        header['senderRatchetKeyB64']?.toString() ?? '';
 
     final identity =
         _x25519KeyPair(local.identityPrivateKeyB64, local.identityPublicKeyB64);
@@ -431,7 +512,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
       }
     }
 
-    final root = await _deriveInitialRoot([dh1, dh2, dh3, if (dh4 != null) dh4]);
+    final root =
+        await _deriveInitialRoot([dh1, dh2, dh3, if (dh4 != null) dh4]);
 
     final recv1 = await _kdfRootChain(
       rootKey: root,
@@ -467,15 +549,72 @@ class SoftwareCryptoBridge implements CryptoBridge {
       updatedAt: DateTime.now().millisecondsSinceEpoch,
     );
 
-    return _InboundSessionCreation(session: session, updatedIdentityState: updated);
+    return _InboundSessionCreation(
+      session: session,
+      updatedIdentityState: updated,
+    );
   }
+
+  // ─── ПАТЧ P-3: верификация подписи signed prekey ─────────────────────────
+
+  Future<void> _verifySignedPrekeyBundle(CryptoRemotePrekeyBundle bundle) async {
+    final signingKeyB64 = bundle.identitySigningKeyB64;
+    if (signingKeyB64 == null || signingKeyB64.trim().isEmpty) {
+      throw CryptoBridgeUnavailableException(
+        'SECURITY: cannot establish session with '
+        '${bundle.publicId}:${bundle.deviceId} — '
+        'missing identity signing key in remote bundle. '
+        'Remote device may be running an outdated version.',
+      );
+    }
+
+    final sigBytes = _b64d(bundle.signedPrekeySignatureB64);
+    final prekeyBytes = _b64d(bundle.signedPrekeyB64);
+
+    if (sigBytes.isEmpty || prekeyBytes.isEmpty) {
+      throw CryptoBridgeUnavailableException(
+        'SECURITY: empty signature or prekey for '
+        '${bundle.publicId}:${bundle.deviceId}',
+      );
+    }
+
+    final signingPub = SimplePublicKey(
+      _b64d(signingKeyB64),
+      type: KeyPairType.ed25519,
+    );
+
+    final signature = Signature(sigBytes, publicKey: signingPub);
+
+    bool valid;
+    try {
+      valid = await _ed25519.verify(prekeyBytes, signature: signature);
+    } catch (e) {
+      throw CryptoBridgeUnavailableException(
+        'SECURITY: signed prekey verification threw exception for '
+        '${bundle.publicId}:${bundle.deviceId}: $e',
+      );
+    }
+
+    if (!valid) {
+      throw CryptoBridgeUnavailableException(
+        'SECURITY: signed prekey signature verification FAILED for '
+        '${bundle.publicId}:${bundle.deviceId}. '
+        'Possible MITM or server-side key tampering. '
+        'Session creation aborted.',
+      );
+    }
+  }
+
+  // ─── Double Ratchet helpers ──────────────────────────────────────────────
 
   Future<_DeviceSession> _applyReceiveDhRatchet({
     required _DeviceSession session,
     required String newRemoteRatchetPubB64,
   }) async {
-    final selfPair =
-        _x25519KeyPair(session.selfRatchetPrivateKeyB64, session.selfRatchetPublicKeyB64);
+    final selfPair = _x25519KeyPair(
+      session.selfRatchetPrivateKeyB64,
+      session.selfRatchetPublicKeyB64,
+    );
 
     final recv = await _kdfRootChain(
       rootKey: _b64d(session.rootKeyB64),
@@ -516,8 +655,6 @@ class SoftwareCryptoBridge implements CryptoBridge {
     );
   }
 
-
-
   String _skippedKeyId(String ratchetPubB64, int messageNo) {
     return '$ratchetPubB64:$messageNo';
   }
@@ -534,13 +671,15 @@ class SoftwareCryptoBridge implements CryptoBridge {
       final mk = await _deriveMessageKey(chainKey);
       final next = await _deriveNextChainKey(chainKey);
       cursor += 1;
-      skipped[_skippedKeyId(session.remoteRatchetPublicKeyB64, cursor)] = _b64(mk);
+      skipped[_skippedKeyId(session.remoteRatchetPublicKeyB64, cursor)] =
+          _b64(mk);
       chainKey = next;
     }
 
     final messageKey = await _deriveMessageKey(chainKey);
     final nextChain = await _deriveNextChainKey(chainKey);
 
+    // Ограничение на количество skipped keys (ПАТЧ: MAX_SKIP=1000)
     if (skipped.length > _maxSkippedMessageKeys) {
       final keys = skipped.keys.toList(growable: false);
       final overflow = skipped.length - _maxSkippedMessageKeys;
@@ -556,6 +695,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
       skippedMessageKeys: skipped,
     );
   }
+
+  // ─── KDF helpers ─────────────────────────────────────────────────────────
 
   Future<Uint8List> _deriveInitialRoot(List<Uint8List> sharedParts) async {
     final joined = Uint8List.fromList(sharedParts.expand((e) => e).toList());
@@ -601,6 +742,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
     return Uint8List.fromList(mac.bytes.sublist(0, 32));
   }
 
+  // ─── Key helpers ─────────────────────────────────────────────────────────
+
   Future<Uint8List> _shared(KeyPair local, SimplePublicKey remote) async {
     final shared = await _x25519.sharedSecretKey(
       keyPair: local,
@@ -621,6 +764,69 @@ class SoftwareCryptoBridge implements CryptoBridge {
     );
   }
 
+  // ─── Signed prekey rotation ──────────────────────────────────────────────
+
+  Future<_LocalIdentityState> _rotateSignedPrekey(
+    _ProfileRef ref,
+    _LocalIdentityState state,
+  ) async {
+    final signing = _ed25519KeyPairFromB64(
+      state.signingPrivateKeyB64,
+      state.signingPublicKeyB64,
+    );
+
+    final newPrekey = await _x25519.newKeyPair();
+    final newPrekeyPub = await newPrekey.extractPublicKey();
+    final newSig = await _ed25519.sign(newPrekeyPub.bytes, keyPair: signing);
+
+    final rotated = _LocalIdentityState(
+      deviceId: state.deviceId,
+      identityPublicKeyB64: state.identityPublicKeyB64,
+      identityPrivateKeyB64: state.identityPrivateKeyB64,
+      signingPublicKeyB64: state.signingPublicKeyB64,
+      signingPrivateKeyB64: state.signingPrivateKeyB64,
+      signedPrekeyPublicKeyB64: _b64(newPrekeyPub.bytes),
+      signedPrekeyPrivateKeyB64:
+          _b64(await newPrekey.extractPrivateKeyBytes()),
+      signedPrekeySignatureB64: _b64(newSig.bytes),
+      signedPrekeyKeyId: state.signedPrekeyKeyId + 1,
+      oneTimePrekeys: state.oneTimePrekeys,
+      updatedAt: DateTime.now().millisecondsSinceEpoch,
+    );
+
+    await _saveIdentityState(ref, rotated);
+    return rotated;
+  }
+
+  SimpleKeyPairData _ed25519KeyPairFromB64(String privB64, String pubB64) {
+    return SimpleKeyPairData(
+      _b64d(privB64),
+      publicKey: SimplePublicKey(_b64d(pubB64), type: KeyPairType.ed25519),
+      type: KeyPairType.ed25519,
+    );
+  }
+
+  // ─── OTK generation ──────────────────────────────────────────────────────
+
+  Future<List<_OneTimePrivatePrekey>> _generateOtkBatch(int count) async {
+    final list = <_OneTimePrivatePrekey>[];
+    for (var i = 0; i < count; i++) {
+      final kp = await _x25519.newKeyPair();
+      final pub = await kp.extractPublicKey();
+      list.add(
+        _OneTimePrivatePrekey(
+          id: 'otk_${_randomToken(12)}',
+          publicKeyB64: _b64(pub.bytes),
+          privateKeyB64: _b64(await kp.extractPrivateKeyBytes()),
+          consumedAt: null,
+        ),
+      );
+    }
+    return list;
+  }
+
+  // ─── KeyPackage builder ──────────────────────────────────────────────────
+
   CryptoDeviceKeyPackage _toKeyPackage(_LocalIdentityState state) {
     return CryptoDeviceKeyPackage(
       deviceId: state.deviceId,
@@ -636,6 +842,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
           .toList(growable: false),
     );
   }
+
+  // ─── Persistent state ────────────────────────────────────────────────────
 
   Future<_LocalIdentityState?> _loadIdentityState(_ProfileRef ref) async {
     final raw = await _secureStorage.readJson(
@@ -656,7 +864,10 @@ class SoftwareCryptoBridge implements CryptoBridge {
     return state;
   }
 
-  Future<void> _saveIdentityState(_ProfileRef ref, _LocalIdentityState state) {
+  Future<void> _saveIdentityState(
+    _ProfileRef ref,
+    _LocalIdentityState state,
+  ) {
     return _secureStorage.writeJson(
       publicId: ref.publicId,
       deviceId: ref.deviceId,
@@ -678,10 +889,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
 
     final sessionsRaw = raw['sessions'] as Map;
     return sessionsRaw.map(
-      (k, v) => MapEntry(
-        k.toString(),
-        _DeviceSession.fromJson(_toMap(v)),
-      ),
+      (k, v) =>
+          MapEntry(k.toString(), _DeviceSession.fromJson(_toMap(v))),
     );
   }
 
@@ -698,6 +907,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
       },
     );
   }
+
+  // ─── Utilities ───────────────────────────────────────────────────────────
 
   _ProfileRef _normalizeProfile(UserProfile profile) {
     return _ProfileRef(
@@ -734,7 +945,8 @@ class SoftwareCryptoBridge implements CryptoBridge {
   }
 
   String _randomToken(int length) {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    const chars =
+        'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     final r = Random.secure();
     final b = StringBuffer();
     for (var i = 0; i < length; i++) {
@@ -759,16 +971,19 @@ class SoftwareCryptoBridge implements CryptoBridge {
   }
 }
 
+// ─── Internal DTOs ──────────────────────────────────────────────────────────
+
 class _ProfileRef {
   const _ProfileRef({required this.publicId, required this.deviceId});
-
   final String publicId;
   final String deviceId;
 }
 
 class _ClaimedOneTimePublic {
-  const _ClaimedOneTimePublic({required this.id, required this.publicKeyB64});
-
+  const _ClaimedOneTimePublic({
+    required this.id,
+    required this.publicKeyB64,
+  });
   final String id;
   final String publicKeyB64;
 }
@@ -780,7 +995,6 @@ class _SkippedDeriveResult {
     required this.newRecvMessageNo,
     required this.skippedMessageKeys,
   });
-
   final Uint8List messageKey;
   final Uint8List nextChainKey;
   final int newRecvMessageNo;
@@ -789,7 +1003,6 @@ class _SkippedDeriveResult {
 
 class _RootChain {
   const _RootChain({required this.newRootKey, required this.newChainKey});
-
   final Uint8List newRootKey;
   final Uint8List newChainKey;
 }
@@ -800,7 +1013,6 @@ class _OutboundInit {
     required this.handshakeEphemeralPublicKeyB64,
     required this.usedOneTimePrekeyRef,
   });
-
   final _DeviceSession session;
   final String handshakeEphemeralPublicKeyB64;
   final String? usedOneTimePrekeyRef;
@@ -811,7 +1023,6 @@ class _InboundSessionCreation {
     required this.session,
     required this.updatedIdentityState,
   });
-
   final _DeviceSession session;
   final _LocalIdentityState updatedIdentityState;
 }
@@ -905,9 +1116,7 @@ class _LocalIdentityState {
       signedPrekeySignatureB64: signedPrekeySignatureB64,
       signedPrekeyKeyId: signedPrekeyKeyId,
       oneTimePrekeys: oneTimePrekeys
-          .map(
-            (k) => k.id == prekeyId ? k.copyWith(consumedAt: consumedAt) : k,
-          )
+          .map((k) => k.id == prekeyId ? k.copyWith(consumedAt: consumedAt) : k)
           .toList(growable: false),
       updatedAt: DateTime.now().millisecondsSinceEpoch,
     );
@@ -1042,7 +1251,8 @@ class _DeviceSession {
       rootKeyB64: json['rootKeyB64']?.toString() ?? '',
       selfRatchetPrivateKeyB64:
           json['selfRatchetPrivateKeyB64']?.toString() ?? '',
-      selfRatchetPublicKeyB64: json['selfRatchetPublicKeyB64']?.toString() ?? '',
+      selfRatchetPublicKeyB64:
+          json['selfRatchetPublicKeyB64']?.toString() ?? '',
       remoteRatchetPublicKeyB64:
           json['remoteRatchetPublicKeyB64']?.toString() ?? '',
       sendChainKeyB64: json['sendChainKeyB64']?.toString() ?? '',

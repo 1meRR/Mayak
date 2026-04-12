@@ -2,10 +2,12 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../models/app_models.dart';
 import '../services/api_service.dart';
+import '../services/app_notification_service.dart';
 import '../services/device_socket_service.dart';
 import '../services/e2ee/crypto_bridge.dart';
 import '../services/e2ee/e2ee_file_service.dart';
@@ -23,6 +25,7 @@ import 'chat_screen.dart';
 import 'friends_screen.dart';
 import 'incoming_call_screen.dart';
 import 'onboarding_screen.dart';
+import 'outgoing_call_screen.dart';
 import 'profile_screen.dart';
 
 class AppShellScreen extends StatefulWidget {
@@ -36,6 +39,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
   final SettingsRepository _settings = SettingsRepository();
   final LocalMessageStore _messageStore = LocalMessageStore();
   final DeviceSocketService _deviceSocket = DeviceSocketService();
+  final AppNotificationService _notifications = AppNotificationService();
 
   bool _loading = true;
   bool _syncing = false;
@@ -91,6 +95,8 @@ class _AppShellScreenState extends State<AppShellScreen> {
     });
 
     try {
+      await _notifications.initialize();
+
       final profile = await _settings.ensureProfile();
       final api = ApiService(profile.serverUrl);
       final mailbox = MailboxService(profile.serverUrl);
@@ -111,7 +117,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
       FriendsBundle? bundle;
       if (profile.registered && profile.publicId.trim().isNotEmpty) {
-        bundle = await api.fetchFriends(profile.publicId);
+        bundle = await _safeFetchFriends(api, profile);
       }
 
       if (!mounted) return;
@@ -125,6 +131,9 @@ class _AppShellScreenState extends State<AppShellScreen> {
         _bundle = bundle;
         _loading = false;
       });
+
+      // ПАТЧ P-2: передаём профиль в LocalMessageStore для ключа шифрования
+      _messageStore.setProfile(profile);
 
       await _ensureMailboxBootstrap();
       await _ensureRealtime();
@@ -183,7 +192,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
     _syncing = true;
     try {
-      final nextBundle = await api.fetchFriends(profile.publicId);
+      final nextBundle = await _safeFetchFriends(api, profile);
 
       if (!mounted) return;
       setState(() {
@@ -195,6 +204,23 @@ class _AppShellScreenState extends State<AppShellScreen> {
       debugPrint('Background sync failed: $e');
     } finally {
       _syncing = false;
+    }
+  }
+
+  Future<FriendsBundle> _safeFetchFriends(
+    ApiService api,
+    UserProfile profile,
+  ) async {
+    try {
+      return await api.fetchFriends(profile.publicId);
+    } catch (e) {
+      if (e.toString().contains('HTTP 404')) {
+        debugPrint(
+          'Friends API is unavailable on server ${profile.serverUrl}; using empty friend bundle fallback.',
+        );
+        return FriendsBundle.empty(profile.publicId);
+      }
+      rethrow;
     }
   }
 
@@ -252,6 +278,11 @@ class _AppShellScreenState extends State<AppShellScreen> {
           deliveredAt: DateTime.fromMillisecondsSinceEpoch(item.createdAt),
           acknowledgedAt: DateTime.now(),
           message: message,
+        );
+
+        await _notifications.showIncomingMessage(
+          fromName: friend?.displayName ?? senderPublicId,
+          text: item.plaintext,
         );
 
         if (maxSeq == null || item.serverSeq > maxSeq) {
@@ -322,6 +353,11 @@ class _AppShellScreenState extends State<AppShellScreen> {
 
       _presentingIncomingCall = true;
       _handledIncomingInviteIds.add(invite.id);
+
+      await _notifications.showIncomingCall(
+        fromName: friend.displayName,
+        roomId: invite.roomId,
+      );
 
       if (!mounted) {
         _presentingIncomingCall = false;
@@ -527,7 +563,7 @@ class _AppShellScreenState extends State<AppShellScreen> {
     );
   }
 
-  Future<void> _sendDemoEncryptedFile(FriendUser friend, String label) async {
+  Future<void> _sendEncryptedAttachment(FriendUser friend, String label) async {
     final profile = _profile;
     final mailbox = _mailbox;
     final transfer = _fileTransfer;
@@ -556,14 +592,26 @@ class _AppShellScreenState extends State<AppShellScreen> {
       );
     }
 
-    final bytes = Uint8List.fromList(
-      utf8.encode('mayak_demo_file:${DateTime.now().toIso8601String()}:$label'),
+    final picked = await FilePicker.platform.pickFiles(
+      withData: true,
+      allowMultiple: false,
+      type: FileType.any,
     );
+    final files = picked?.files;
+    final file = (files == null || files.isEmpty) ? null : files.first;
+    if (file == null) {
+      return;
+    }
+
+    final bytes = file.bytes;
+    if (bytes == null || bytes.isEmpty) {
+      throw Exception('Не удалось прочитать файл');
+    }
 
     final prepared = await transfer.prepareAndPersistUpload(
       sender: profile,
-      fileName: 'demo_${DateTime.now().millisecondsSinceEpoch}.txt',
-      mediaType: 'text/plain',
+      fileName: file.name,
+      mediaType: _guessMediaType(file.extension),
       plaintext: bytes,
       recipients: recipients,
     );
@@ -588,12 +636,86 @@ class _AppShellScreenState extends State<AppShellScreen> {
           e2ee: e2ee,
           onSyncRequested: _backgroundMailboxSync,
           onSafetyNumberRequested: () => _buildSafetyNumber(friend),
-          onSendFileRequested: (label) => _sendDemoEncryptedFile(friend, label),
+          onSendFileRequested: (label) => _sendEncryptedAttachment(friend, label),
         ),
       ),
     );
 
     await _backgroundSync(force: true);
+  }
+
+  Future<void> _openOutgoingCall(FriendUser friend) async {
+    final profile = _profile;
+    final api = _api;
+    if (profile == null || api == null) return;
+
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => OutgoingCallScreen(
+          profile: profile,
+          friend: friend,
+          api: api,
+          socket: _deviceSocket,
+        ),
+      ),
+    );
+
+    await _backgroundSync(force: true);
+  }
+
+  Future<void> _deleteFriend(FriendUser friend) async {
+    final profile = _profile;
+    final api = _api;
+    if (profile == null || api == null) return;
+
+    final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: const Text('Удалить друга?'),
+            content: Text('Удалить ${friend.displayName} из списка друзей?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Отмена'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('Удалить'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+
+    if (!confirmed) return;
+
+    try {
+      await api.deleteFriend(
+        actorPublicId: profile.publicId,
+        actorDeviceId: profile.deviceId,
+        sessionToken: profile.sessionToken,
+        friendPublicId: friend.publicId,
+      );
+      await _backgroundSync(force: true);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ошибка удаления друга: $e')),
+      );
+    }
+  }
+
+  String _guessMediaType(String? extension) {
+    final ext = extension?.toLowerCase().trim() ?? '';
+    if (ext == 'jpg' || ext == 'jpeg') return 'image/jpeg';
+    if (ext == 'png') return 'image/png';
+    if (ext == 'gif') return 'image/gif';
+    if (ext == 'webp') return 'image/webp';
+    if (ext == 'mp4') return 'video/mp4';
+    if (ext == 'mov') return 'video/quicktime';
+    if (ext == 'mkv') return 'video/x-matroska';
+    if (ext == 'pdf') return 'application/pdf';
+    return 'application/octet-stream';
   }
 
   Widget _buildBody() {
@@ -646,8 +768,11 @@ class _AppShellScreenState extends State<AppShellScreen> {
           incomingRequests: bundle.incomingRequests,
           outgoingRequests: bundle.outgoingRequests,
           onOpenChat: _openChat,
+          onStartVoiceCall: _openOutgoingCall,
+          onStartVideoCall: _openOutgoingCall,
           onAcceptRequest: _acceptRequest,
           onRejectRequest: _rejectRequest,
+          onDeleteFriend: _deleteFriend,
           onRefresh: () => _backgroundSync(force: true),
         );
       case 1:
@@ -668,8 +793,11 @@ class _AppShellScreenState extends State<AppShellScreen> {
           incomingRequests: bundle.incomingRequests,
           outgoingRequests: bundle.outgoingRequests,
           onOpenChat: _openChat,
+          onStartVoiceCall: _openOutgoingCall,
+          onStartVideoCall: _openOutgoingCall,
           onAcceptRequest: _acceptRequest,
           onRejectRequest: _rejectRequest,
+          onDeleteFriend: _deleteFriend,
           onRefresh: () => _backgroundSync(force: true),
         );
     }

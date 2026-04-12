@@ -3,6 +3,7 @@ import 'crypto_bridge.dart';
 import 'crypto_models.dart';
 import 'mailbox_models.dart';
 import 'mailbox_service.dart';
+import 'software_crypto_bridge.dart';
 
 class E2eeMessageService {
   E2eeMessageService({
@@ -26,12 +27,23 @@ class E2eeMessageService {
       );
     }
 
-    final keyPackage = await _cryptoBridge.ensureLocalDeviceIdentity(profile);
+    // ПАТЧ P-8: проверяем, нужна ли ротация signed prekey,
+    // и публикуем обновлённый package если нужно
+    CryptoDeviceKeyPackage keyPackage;
+    if (_cryptoBridge is SoftwareCryptoBridge) {
+      keyPackage = await (_cryptoBridge as SoftwareCryptoBridge)
+          .rotateSignedPrekeyIfNeeded(profile);
+    } else {
+      keyPackage = await _cryptoBridge.ensureLocalDeviceIdentity(profile);
+    }
 
     await _mailboxService.uploadDeviceKeyPackage(
       profile: profile,
       payload: keyPackage.toMailboxPayload(),
     );
+
+    // ПАТЧ P-9: после публикации проверяем OTK pool и дополняем если нужно
+    await _refillOtkIfNeeded(profile);
   }
 
   Future<List<StoredEnvelopeView>> sendEncryptedText({
@@ -54,27 +66,60 @@ class E2eeMessageService {
 
     await ensurePublishedDeviceKeys(senderProfile);
 
-    final devices = await _mailboxService.listDevicesRaw(friend.publicId);
-    final recipientDevices = devices
+    // Устройства получателя
+    final recipientDevices = await _mailboxService.listDevicesRaw(friend.publicId);
+    final filteredRecipient = recipientDevices
         .where(
-          (device) => device.publicId.trim().toUpperCase() ==
+          (device) =>
+              device.publicId.trim().toUpperCase() ==
               friend.publicId.trim().toUpperCase(),
         )
         .toList();
 
-    if (recipientDevices.isEmpty) {
+    if (filteredRecipient.isEmpty) {
       throw Exception('У получателя нет доступных устройств для доставки');
     }
 
     final remoteBundles = <CryptoRemotePrekeyBundle>[];
-    for (final device in recipientDevices) {
+
+    // Prekeys для устройств получателя
+    for (final device in filteredRecipient) {
       final claimed = await _mailboxService.claimPrekey(
         targetPublicId: friend.publicId,
         targetDeviceId: device.deviceId,
+        callerToken: senderProfile.sessionToken, // ПАТЧ P-4: передаём токен
       );
       remoteBundles.add(
         CryptoRemotePrekeyBundle.fromClaimedBundle(claimed),
       );
+    }
+
+    // ПАТЧ: Sender sync copy — шифруем для других устройств отправителя
+    // чтобы история была видна на всех устройствах Alice
+    final senderDevices = await _mailboxService.listDevicesRaw(senderProfile.publicId);
+    final otherSenderDevices = senderDevices
+        .where(
+          (d) =>
+              d.publicId.trim().toUpperCase() ==
+                  senderProfile.publicId.trim().toUpperCase() &&
+              d.deviceId.trim().toUpperCase() !=
+                  senderProfile.deviceId.trim().toUpperCase(),
+        )
+        .toList();
+
+    for (final device in otherSenderDevices) {
+      try {
+        final claimed = await _mailboxService.claimPrekey(
+          targetPublicId: senderProfile.publicId,
+          targetDeviceId: device.deviceId,
+          callerToken: senderProfile.sessionToken, // ПАТЧ P-4
+        );
+        remoteBundles.add(
+          CryptoRemotePrekeyBundle.fromClaimedBundle(claimed),
+        );
+      } catch (_) {
+        // Не блокируем отправку если sync copy не удалась
+      }
     }
 
     final conversationId = buildDirectConversationId(
@@ -98,13 +143,18 @@ class E2eeMessageService {
       throw Exception('crypto bridge did not produce any recipient envelopes');
     }
 
-    return _mailboxService.sendEncryptedEnvelopes(
+    final result = await _mailboxService.sendEncryptedEnvelopes(
       profile: senderProfile,
       conversationId: conversationId,
       senderDeviceId: senderProfile.deviceId,
       recipients:
           outgoing.map((item) => item.toRecipientEnvelopePayload()).toList(),
     );
+
+    // ПАТЧ P-9: после отправки проверяем OTK pool
+    await _refillOtkIfNeeded(senderProfile);
+
+    return result;
   }
 
   Future<List<CryptoDecryptedEnvelope>> fetchAndDecryptPending({
@@ -147,6 +197,31 @@ class E2eeMessageService {
       );
     }
 
+    // ПАТЧ P-9: после получения сообщений (OTK могли быть потреблены)
+    // проверяем пул
+    await _refillOtkIfNeeded(profile);
+
     return decrypted;
+  }
+
+  // ПАТЧ P-9: вспомогательный метод пополнения OTK пула
+  Future<void> _refillOtkIfNeeded(UserProfile profile) async {
+    if (_cryptoBridge is! SoftwareCryptoBridge) return;
+
+    final bridge = _cryptoBridge as SoftwareCryptoBridge;
+    try {
+      final needs = await bridge.needsOtkRefill(profile);
+      if (!needs) return;
+
+      final newOtks = await bridge.generateAndSaveOtkBatch(profile);
+      if (newOtks.isNotEmpty) {
+        await _mailboxService.replenishOneTimePrekeys(
+          profile: profile,
+          oneTimePrekeys: newOtks,
+        );
+      }
+    } catch (_) {
+      // OTK refill не должен ронать основной flow
+    }
   }
 }

@@ -30,8 +30,9 @@ class MailboxService {
     final base = _baseUri();
     return base.replace(
       path: path,
-      queryParameters:
-          queryParameters?.map((key, value) => MapEntry(key, value.toString())),
+      queryParameters: queryParameters?.map(
+        (key, value) => MapEntry(key, value.toString()),
+      ),
     );
   }
 
@@ -130,8 +131,6 @@ class MailboxService {
       }
     }
 
-    // сервер этого endpoint сейчас отдаёт просто массив;
-    // сюда мы не попадём при нормальном GET через http.get + _decode(Map)
     return const <MailboxDeviceView>[];
   }
 
@@ -143,7 +142,9 @@ class MailboxService {
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       final decoded = await _decode(response);
-      throw Exception(decoded['error']?.toString() ?? 'HTTP ${response.statusCode}');
+      throw Exception(
+        decoded['error']?.toString() ?? 'HTTP ${response.statusCode}',
+      );
     }
 
     final body = response.body.trim();
@@ -180,13 +181,18 @@ class MailboxService {
     return ClaimedPrekeyBundle.fromJson(decoded);
   }
 
+  // ПАТЧ P-4: claimPrekey теперь принимает callerToken.
+  // Сервер должен проверять, что вызывающий — аутентифицированный пользователь.
+  // callerToken = sessionToken звонящего (не получателя).
   Future<ClaimedPrekeyBundle> claimPrekey({
     required String targetPublicId,
     required String targetDeviceId,
+    String? callerToken, // ПАТЧ P-4: обязательно передавать при отправке сообщения
   }) async {
     final decoded = await _request(
       'POST',
       _uri('/v1/prekeys/claim'),
+      bearerToken: callerToken, // ПАТЧ P-4: передаём токен вызывающего
       body: {
         'publicId': targetPublicId.trim().toUpperCase(),
         'deviceId': targetDeviceId.trim().toUpperCase(),
@@ -194,6 +200,24 @@ class MailboxService {
     );
 
     return ClaimedPrekeyBundle.fromJson(decoded);
+  }
+
+  // ПАТЧ P-9: загрузка новой порции OTK на сервер при истощении пула
+  Future<void> replenishOneTimePrekeys({
+    required UserProfile profile,
+    required List<String> oneTimePrekeys, // формат "id:publicKeyB64"
+  }) async {
+    if (oneTimePrekeys.isEmpty) return;
+
+    await _request(
+      'POST',
+      _uri('/v1/devices/prekeys/replenish'),
+      bearerToken: profile.sessionToken,
+      body: {
+        'deviceId': profile.deviceId.trim().toUpperCase(),
+        'oneTimePrekeys': oneTimePrekeys,
+      },
+    );
   }
 
   Future<List<StoredEnvelopeView>> sendEncryptedEnvelopes({
@@ -316,6 +340,7 @@ class MailboxService {
 
     return FileLookupMailboxResponse.fromJson(decoded);
   }
+
   Future<void> uploadFileChunk({
     required UserProfile profile,
     required String fileId,
@@ -334,7 +359,9 @@ class MailboxService {
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       final decoded = await _decode(response);
-      throw Exception(decoded['error']?.toString() ?? 'HTTP ${response.statusCode}');
+      throw Exception(
+        decoded['error']?.toString() ?? 'HTTP ${response.statusCode}',
+      );
     }
   }
 
@@ -353,10 +380,11 @@ class MailboxService {
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       final decoded = await _decode(response);
-      throw Exception(decoded['error']?.toString() ?? 'HTTP ${response.statusCode}');
+      throw Exception(
+        decoded['error']?.toString() ?? 'HTTP ${response.statusCode}',
+      );
     }
 
     return response.bodyBytes;
   }
-
 }

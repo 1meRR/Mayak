@@ -1,9 +1,47 @@
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/app_models.dart';
+
+// ─── Secure token storage (ПАТЧ P-1) ────────────────────────────────────────
+// sessionToken хранится ТОЛЬКО в flutter_secure_storage.
+// В SharedPreferences токен не попадает никогда.
+class _SecureTokenStorage {
+  static const _storage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: IOSOptions(
+      accessibility: KeychainAccessibility.first_unlock_this_device,
+    ),
+  );
+
+  static String _key(String deviceId) =>
+      'mayak_session_token_v1:${deviceId.trim().toUpperCase()}';
+
+  static Future<void> save({
+    required String deviceId,
+    required String token,
+  }) async {
+    if (token.trim().isEmpty) {
+      await delete(deviceId: deviceId);
+      return;
+    }
+    await _storage.write(key: _key(deviceId), value: token.trim());
+  }
+
+  static Future<String?> read({required String deviceId}) async {
+    if (deviceId.trim().isEmpty) return null;
+    return _storage.read(key: _key(deviceId));
+  }
+
+  static Future<void> delete({required String deviceId}) async {
+    if (deviceId.trim().isEmpty) return;
+    await _storage.delete(key: _key(deviceId));
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 class SettingsRepository {
   static const _profileKey = 'mayak_profile';
@@ -64,9 +102,19 @@ class SettingsRepository {
       return null;
     }
 
-    final profile = UserProfile.fromJson(
+    var profile = UserProfile.fromJson(
       decoded.map((key, value) => MapEntry(key.toString(), value)),
     );
+
+    // ПАТЧ P-1: восстанавливаем токен из secure storage, не из SharedPreferences
+    if (profile.deviceId.trim().isNotEmpty) {
+      final storedToken = await _SecureTokenStorage.read(
+        deviceId: profile.deviceId,
+      );
+      if (storedToken != null && storedToken.trim().isNotEmpty) {
+        profile = profile.copyWith(sessionToken: storedToken.trim());
+      }
+    }
 
     final migrated = _normalizeProfile(profile);
 
@@ -79,7 +127,23 @@ class SettingsRepository {
 
   Future<void> saveProfile(UserProfile profile) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_profileKey, jsonEncode(profile.toJson()));
+
+    // ПАТЧ P-1: сохраняем профиль БЕЗ токена в SharedPreferences
+    final profileWithoutToken = profile.copyWith(sessionToken: '');
+    await prefs.setString(
+      _profileKey,
+      jsonEncode(profileWithoutToken.toJson()),
+    );
+
+    // ПАТЧ P-1: токен — только в secure storage
+    if (profile.deviceId.trim().isNotEmpty) {
+      if (profile.sessionToken.trim().isNotEmpty) {
+        await _SecureTokenStorage.save(
+          deviceId: profile.deviceId,
+          token: profile.sessionToken,
+        );
+      }
+    }
 
     await saveBaseSettings(
       displayName: profile.displayName,
@@ -87,8 +151,13 @@ class SettingsRepository {
     );
   }
 
+  /// Вызывается при логауте — удаляет токен из обоих хранилищ.
   Future<void> clearSession() async {
     final existing = await ensureProfile();
+
+    // ПАТЧ P-1: удаляем токен из secure storage
+    await _SecureTokenStorage.delete(deviceId: existing.deviceId);
+
     await clearMailboxCursor(existing);
     await clearDeviceKeyPackageState(existing);
 
@@ -223,7 +292,8 @@ class SettingsRepository {
   }
 
   static String buildDirectChatId(String left, String right) {
-    final items = [left.trim().toUpperCase(), right.trim().toUpperCase()]..sort();
+    final items = [left.trim().toUpperCase(), right.trim().toUpperCase()]
+      ..sort();
     return 'dm_${items.join('_')}';
   }
 

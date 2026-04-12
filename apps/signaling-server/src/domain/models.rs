@@ -233,3 +233,117 @@ pub struct FileLookupResponse {
 pub struct ErrorResponse {
     pub error: String,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendUserView {
+    pub public_id: String,
+    pub friend_code: String,
+    pub display_name: String,
+    pub about: String,
+    pub created_at: i64,
+    pub is_online: bool,
+    pub last_seen_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserLookupResponse {
+    pub user: FriendUserView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendRequestView {
+    pub id: String,
+    pub request_id: String,
+    pub from_public_id: String,
+    pub from_display_name: String,
+    pub to_public_id: String,
+    pub to_display_name: String,
+    pub status: String,
+    pub created_at: i64,
+    pub responded_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendsBundleView {
+    pub public_id: String,
+    pub friends: Vec<FriendUserView>,
+    pub incoming_requests: Vec<FriendRequestView>,
+    pub outgoing_requests: Vec<FriendRequestView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFriendRequestRequest {
+    pub from_public_id: String,
+    pub from_device_id: String,
+    pub session_token: String,
+    pub to_public_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RespondFriendRequestRequest {
+    pub request_id: String,
+    pub actor_public_id: String,
+    pub actor_device_id: String,
+    pub session_token: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteFriendRequest {
+    pub actor_public_id: String,
+    pub actor_device_id: String,
+    pub session_token: String,
+    pub friend_public_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteFriendResponse {
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCallInviteRequest {
+    pub caller_public_id: String,
+    pub caller_device_id: String,
+    pub session_token: String,
+    pub callee_public_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RespondCallInviteRequest {
+    pub invite_id: String,
+    pub actor_public_id: String,
+    pub actor_device_id: String,
+    pub session_token: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallInviteView {
+    pub invite_id: String,
+    pub caller_public_id: String,
+    pub caller_display_name: String,
+    pub callee_public_id: String,
+    pub callee_display_name: String,
+    pub room_id: String,
+    pub status: String,
+    pub created_at: i64,
+    pub responded_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingCallListResponse {
+    pub items: Vec<CallInviteView>,
+}

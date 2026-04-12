@@ -27,6 +27,7 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
   FriendUser? _foundUser;
   bool _searching = false;
   bool _sending = false;
+  String? _statusMessage;
 
   @override
   void dispose() {
@@ -55,6 +56,7 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
     setState(() {
       _searching = true;
       _foundUser = null;
+      _statusMessage = null;
     });
 
     try {
@@ -63,11 +65,19 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
       if (!mounted) return;
       setState(() {
         _foundUser = user;
+        _statusMessage = 'Пользователь найден. Можно отправить заявку.';
       });
     } catch (error) {
+      final message = error.toString().contains('HTTP 404')
+          ? 'Этот сервер не поддерживает поиск друзей (/v1/users/*). '
+              'Нужен backend с friends API.'
+          : 'Поиск не удался: $error';
       if (!mounted) return;
+      setState(() {
+        _statusMessage = message;
+      });
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Поиск не удался: $error')),
+        SnackBar(content: Text(message)),
       );
     } finally {
       if (mounted) {
@@ -93,6 +103,7 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
 
     setState(() {
       _sending = true;
+      _statusMessage = null;
     });
 
     try {
@@ -108,12 +119,21 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Заявка отправлена пользователю ${foundUser.displayName}')),
       );
+      setState(() {
+        _statusMessage = 'Заявка отправлена.';
+      });
 
       await widget.onFriendRequestSent();
     } catch (error) {
+      final message = error.toString().contains('HTTP 404')
+          ? 'Этот сервер не поддерживает отправку заявок (/v1/friends/*).'
+          : 'Не удалось отправить заявку: $error';
       if (!mounted) return;
+      setState(() {
+        _statusMessage = message;
+      });
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Не удалось отправить заявку: $error')),
+        SnackBar(content: Text(message)),
       );
     } finally {
       if (mounted) {
@@ -179,6 +199,18 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
                         : const Icon(Icons.search_rounded),
                     label: const Text('Найти пользователя'),
                   ),
+                  if (_statusMessage != null) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      _statusMessage!,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: _statusMessage!.startsWith('Пользователь найден') ||
+                                _statusMessage!.startsWith('Заявка отправлена')
+                            ? Colors.lightGreenAccent
+                            : theme.colorScheme.error,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
